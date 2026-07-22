@@ -73,6 +73,27 @@ function M.defaults()
     negotiation = { maxRounds = 4, concedeStepPct = 3, chatCooldownSec = 4 },
     ads = { rotatingAds = false, autoInvite = false, stockOnly = true, intervalSec = 45 },
     items = {},               -- [name] = { value?, markupPct?, bandPct?, forSale? }
+
+    -- Auto-buyer at gem cap
+    buyEnabled = true,
+    gemCap = 100000000,       -- switch to buy-only at/above this many gems
+    gemCapBuffer = 5000000,   -- resume selling once gems fall below (cap - buffer)
+    buyDiscountPct = 10,      -- maxBuy = value * (1 - buyDiscount/100)
+    buy = {},                 -- [name] = { wantBuy?, maxBuyPrice?, maxQty? }
+
+    -- Scam-guard + per-player throttling
+    cooldownSec = 30,         -- min seconds between trades with the same player
+    blocklist = {},           -- [playerName] = true
+
+    -- 24/7 survival
+    survival = { autoReconnect = true, antiAfk = true, watchdog = true,
+                 watchdogMaxErrors = 5 },
+
+    -- Discord webhook (url stored locally only; blank = disabled)
+    webhook = { url = "", onSale = true, onCap = true, onDisconnect = true, onError = true },
+
+    -- Housekeeping
+    feedRefreshSec = 1800,    -- re-fetch the value feed every 30 min (0 = never)
   }
 end
 
@@ -126,6 +147,33 @@ function M.quote(cfg, feedEntry, override, qty)
   return { ask = ask, ceiling = ceiling, floor = floor }
 end
 
+-- Buy-side quote for the auto-buyer (gem-cap mode).
+-- Returns { max, floorBid } for `qty` copies, or nil if no base price.
+--   max      = the most you'll pay (value * (1 - buyDiscount%), or explicit override)
+--   floorBid = your opening lowball (max * (1 - band%))
+function M.buyQuote(cfg, feedEntry, override, qty)
+  override = override or {}
+  qty = qty or 1
+  local explicit = tonumber(override.maxBuyPrice)
+  local base = explicit or tonumber(feedEntry and feedEntry.value)
+  if not base then return nil end
+
+  local band = tonumber(override.bandPct) or cfg.bandPct or 0
+  local maxUnit
+  if explicit then
+    maxUnit = explicit
+  else
+    local discount = tonumber(override.buyDiscountPct) or cfg.buyDiscountPct or 0
+    local demand = tonumber(feedEntry and feedEntry.demand) or 0
+    if cfg.demandScaling then discount = discount * (1 - demand / 25) end -- high demand -> pay more
+    maxUnit = base * (1 - discount / 100)
+  end
+
+  local max = round(maxUnit) * qty
+  local floorBid = round(maxUnit * (1 - band / 100)) * qty
+  return { max = max, floorBid = floorBid }
+end
+
 return M
 
 end)()
@@ -177,6 +225,48 @@ function M.decide(cfg, quote, state)
   return { action = "HOLD" }
 end
 
+-- BUY side (auto-buyer). Threshold RISES from floorBid toward max over rounds.
+function M.thresholdBuy(cfg, bq, round)
+  local step = (cfg.negotiation and cfg.negotiation.concedeStepPct or 0) / 100
+  local span = bq.max - bq.floorBid
+  local t = bq.floorBid + span * step * (round or 0)
+  if t > bq.max then t = bq.max end
+  return math.floor(t + 0.5)
+end
+
+-- Decide the next BUY move.
+-- state: { sellerAsk, round, elapsed }  (sellerAsk = gems the seller wants)
+-- Returns { action = "ACCEPT"|"COUNTER"|"HOLD"|"ABORT", amount?, message? }
+function M.decideBuy(cfg, bq, state)
+  local maxRounds = cfg.negotiation and cfg.negotiation.maxRounds or 3
+  local threshold = M.thresholdBuy(cfg, bq, state.round or 0)
+  local ask = tonumber(state.sellerAsk)
+
+  -- Seller wants no more than our current willingness -> buy.
+  if ask and ask <= threshold then
+    return { action = "ACCEPT" }
+  end
+
+  if (state.round or 0) >= maxRounds then
+    return { action = "ABORT" }
+  end
+
+  if not ask then
+    return { action = "HOLD" }
+  end
+
+  -- Counter upward, but never above our hard max.
+  local bid
+  if ask <= bq.max then
+    bid = math.floor((threshold + ask) / 2 + 0.5)
+  else
+    bid = threshold           -- their ask exceeds our max; hold our line, keep trying
+  end
+  if bid > bq.max then bid = bq.max end
+  if bid < bq.floorBid then bid = bq.floorBid end
+  return { action = "COUNTER", amount = bid, message = ("I can pay %d"):format(bid) }
+end
+
 return M
 
 end)()
@@ -216,6 +306,149 @@ end
 return M
 
 end)()
+__M["lib.capmode"] = (function()
+local M = {}
+
+-- Decide sell vs buy mode with hysteresis around the gem cap.
+--   gems >= cap                    -> "buy"
+--   in buy mode until gems drop below (cap - buffer), then "sell"
+--   buyEnabled = false             -> always "sell"
+function M.mode(cfg, gems, currentMode)
+  gems = tonumber(gems) or 0
+  if not cfg.buyEnabled then return "sell" end
+  local cap = tonumber(cfg.gemCap) or math.huge
+  local buffer = tonumber(cfg.gemCapBuffer) or 0
+  if gems >= cap then return "buy" end
+  if currentMode == "buy" and gems >= (cap - buffer) then return "buy" end
+  return "sell"
+end
+
+return M
+
+end)()
+__M["lib.scamguard"] = (function()
+local M = {}
+
+-- Final safety check re-run in the same tick right before confirming a SELL:
+-- the gems currently in the window must still meet the agreed threshold.
+-- Defends against last-second offer swaps.
+function M.safeToConfirmSell(agreedThreshold, currentOffered)
+  local a = tonumber(agreedThreshold)
+  local c = tonumber(currentOffered)
+  if not a or not c then return false end
+  return c >= a
+end
+
+-- Same idea for a BUY: the seller must not have raised what they want above
+-- the amount we agreed to pay.
+function M.safeToConfirmBuy(agreedPay, sellerWantsNow)
+  local a = tonumber(agreedPay)
+  local c = tonumber(sellerWantsNow)
+  if not a or not c then return false end
+  return c <= a
+end
+
+return M
+
+end)()
+__M["lib.cooldown"] = (function()
+local M = {}
+
+-- Per-player gate: blocklist first, then a min-seconds-between-trades cooldown.
+-- Returns (allowed: bool, reason: string?).
+function M.allow(cfg, player, lastTradeAt, now)
+  if cfg.blocklist and player and cfg.blocklist[player] then
+    return false, "blocked"
+  end
+  local cd = tonumber(cfg.cooldownSec) or 0
+  if lastTradeAt and now and (now - lastTradeAt) < cd then
+    return false, "cooldown"
+  end
+  return true, nil
+end
+
+return M
+
+end)()
+__M["lib.stats"] = (function()
+local M = {}
+
+function M.new(startTime)
+  return { trades = 0, sells = 0, buys = 0, profit = 0,
+           gemsIn = 0, gemsOut = 0, startTime = startTime or 0 }
+end
+
+-- Record a completed sell: received `gems`, item was worth `cost` to us.
+function M.recordSell(s, gems, cost)
+  gems = tonumber(gems) or 0
+  cost = tonumber(cost) or 0
+  s.trades = s.trades + 1
+  s.sells = s.sells + 1
+  s.gemsIn = s.gemsIn + gems
+  s.profit = s.profit + (gems - cost)
+  return s
+end
+
+-- Record a completed buy: paid `gems`.
+function M.recordBuy(s, gems)
+  gems = tonumber(gems) or 0
+  s.trades = s.trades + 1
+  s.buys = s.buys + 1
+  s.gemsOut = s.gemsOut + gems
+  s.profit = s.profit - gems
+  return s
+end
+
+-- Profit per hour given the current time.
+function M.profitPerHour(s, now)
+  local dt = (tonumber(now) or 0) - (s.startTime or 0)
+  if dt <= 0 then return 0 end
+  return math.floor(s.profit / (dt / 3600) + 0.5)
+end
+
+return M
+
+end)()
+__M["lib.webhook"] = (function()
+local M = {}
+
+-- Build the Discord message content for an event, or nil for unknown events.
+-- The actual HTTP POST is done by glue (runtime); this stays pure/testable.
+function M.content(event, data)
+  data = data or {}
+  if event == "sale" then
+    return ("Sold %s x%d for %s gems (profit %s)")
+      :format(tostring(data.item or "?"), tonumber(data.qty) or 1,
+              tostring(data.gems or 0), tostring(data.profit or 0))
+  elseif event == "buy" then
+    return ("Bought %s x%d for %s gems")
+      :format(tostring(data.item or "?"), tonumber(data.qty) or 1, tostring(data.gems or 0))
+  elseif event == "cap" then
+    return ("Gem cap reached (%s). Switching to buy mode."):format(tostring(data.gems or 0))
+  elseif event == "disconnect" then
+    return "Disconnected - attempting reconnect..."
+  elseif event == "reconnect" then
+    return "Reconnected."
+  elseif event == "error" then
+    return ("Error: %s"):format(tostring(data.msg or "unknown"))
+  end
+  return nil
+end
+
+-- Whether this event should fire, based on config + a non-empty url.
+function M.enabledFor(cfg, event)
+  local w = cfg.webhook
+  if not w or not w.url or w.url == "" then return false end
+  if event == "sale" or event == "buy" then return w.onSale ~= false end
+  if event == "cap" then return w.onCap ~= false end
+  if event == "disconnect" or event == "reconnect" then return w.onDisconnect ~= false end
+  if event == "error" then return w.onError ~= false end
+  return false
+end
+
+return M
+
+end)()
 __M["runtime.persist"] = (function()
 -- Executor file persistence. All calls guarded: features degrade, never crash.
 local HttpService = game:GetService("HttpService")
@@ -223,6 +456,7 @@ local M = {}
 local FOLDER = "OdResto"
 local SETTINGS = FOLDER .. "/autotrade_settings.json"
 local FEEDCACHE = FOLDER .. "/value_cache.json"
+local STATS = FOLDER .. "/autotrade_stats.json"
 
 local function ensureFolder()
   if makefolder and (isfolder == nil or not isfolder(FOLDER)) then
@@ -250,6 +484,8 @@ function M.loadSettings() return readJson(SETTINGS) end
 function M.saveSettings(tbl) return writeJson(SETTINGS, tbl) end
 function M.loadFeedCache() return readJson(FEEDCACHE) end
 function M.saveFeedCache(tbl) return writeJson(FEEDCACHE, tbl) end
+function M.loadStats() return readJson(STATS) end
+function M.saveStats(tbl) return writeJson(STATS, tbl) end
 
 return M
 
@@ -336,79 +572,221 @@ end
 return M
 
 end)()
+__M["runtime.webhook_send"] = (function()
+local HttpService = game:GetService("HttpService")
+local webhook = __M["lib.webhook"]
+local M = {}
+
+local function httpPost(url, jsonBody)
+  local req = http_request or request or (syn and syn.request) or (fluxus and fluxus.request)
+  if not req then return false end
+  return (pcall(function()
+    req({
+      Url = url,
+      Method = "POST",
+      Headers = { ["Content-Type"] = "application/json" },
+      Body = jsonBody,
+    })
+  end))
+end
+
+-- send(cfg, event, data) -> bool. No-op unless the event is enabled + url set.
+function M.send(cfg, event, data)
+  if not webhook.enabledFor(cfg, event) then return false end
+  local content = webhook.content(event, data)
+  if not content then return false end
+  local ok, body = pcall(function() return HttpService:JSONEncode({ content = content }) end)
+  if not ok then return false end
+  return httpPost(cfg.webhook.url, body)
+end
+
+return M
+
+end)()
+__M["runtime.survival"] = (function()
+local Players = game:GetService("Players")
+local M = {}
+
+-- Anti-AFK: defeat the 20-minute idle kick via VirtualUser on the Idled signal.
+function M.startAntiAfk(cfg)
+  if not (cfg.survival and cfg.survival.antiAfk) then return end
+  pcall(function()
+    local VirtualUser = game:GetService("VirtualUser")
+    Players.LocalPlayer.Idled:Connect(function()
+      pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+      end)
+    end)
+  end)
+end
+
+-- Auto-reconnect: on a disconnect/kick error, rejoin the same place.
+-- CONFIRM IN-GAME: the exact disconnect signal your executor surfaces.
+function M.startReconnect(cfg, onEvent)
+  if not (cfg.survival and cfg.survival.autoReconnect) then return end
+  pcall(function()
+    local GuiService = game:GetService("GuiService")
+    local TeleportService = game:GetService("TeleportService")
+    GuiService.ErrorMessageChanged:Connect(function(msg)
+      if onEvent then onEvent("disconnect", { msg = tostring(msg) }) end
+      task.wait(1)
+      pcall(function() TeleportService:Teleport(game.PlaceId, Players.LocalPlayer) end)
+    end)
+  end)
+end
+
+-- Watchdog: run `fn` in a loop; if it errors, report + retry up to maxErrors.
+function M.watchdog(cfg, name, fn, onEvent)
+  if not (cfg.survival and cfg.survival.watchdog) then
+    task.spawn(fn); return
+  end
+  task.spawn(function()
+    local errs = 0
+    while true do
+      local ok, err = pcall(fn)
+      if ok then break end
+      errs = errs + 1
+      if onEvent then onEvent("error", { msg = name .. ": " .. tostring(err) }) end
+      if errs >= (cfg.survival.watchdogMaxErrors or 5) then break end
+      task.wait(2)
+    end
+  end)
+end
+
+return M
+
+end)()
 __M["runtime.trade"] = (function()
 local pricing = __M["lib.pricing"]
 local negotiation = __M["lib.negotiation"]
+local scamguard = __M["lib.scamguard"]
 
 local M = {}
 
--- deps: { remotes, cfg, feed, chat, getTradeState, log }
---   remotes: table from remotes.resolveRemotes()
---   cfg: merged config; feed: normalized feed table
---   chat: { send=fn(text), lastNumberFrom=fn(playerName)->number|nil }
---   getTradeState: fn() -> { offeredGemsTarget, offeredItemsTarget, targetName,
---                            targetQty, wantedSet } | nil
---   log: fn(text)
+-- deps: { remotes, cfg, feed, chat, getTradeState, log,
+--         mode, gate, onSold, onBought }
+--   mode:  fn() -> "sell" | "buy"   (from capmode)
+--   gate:  fn(playerName) -> bool    (cooldown + blocklist; also records the trade)
+--   onSold:   fn(item, qty, gems, quote)   stats + webhook
+--   onBought: fn(item, qty, gems)          stats + webhook
 function M.new(deps) return setmetatable({ d = deps, busy = false }, { __index = M }) end
 
 function M:handleInvite()
   if self.busy then return end
   self.busy = true
-  local d = self.d
   local ok, err = pcall(function()
-    d.remotes.trading_acceptinvite:FireServer()
-    local st = self:waitForOffer(d.cfg.tradeTimeoutSec)
-    if not st or not st.wantedSet then return self:abort("no wanted set") end
-
-    local feedEntry = d.feed[st.wantedSet]
-    local override = (d.cfg.items or {})[st.wantedSet] or {}
-    if override.forSale == false then return self:abort("not for sale: " .. st.wantedSet) end
-
-    local qty = st.targetQty or 1
-    local quote = pricing.quote(d.cfg, feedEntry or {}, override, qty)
-    if not quote then return self:abort("unpriceable: " .. st.wantedSet) end
-
-    self:addItem(st.wantedSet, qty)
-    self:negotiate(st, quote)
+    if self.d.mode and self.d.mode() == "buy" and self.d.cfg.buyEnabled then
+      self:runBuy()
+    else
+      self:runSell()
+    end
   end)
   if not ok then self:abort("error: " .. tostring(err)) end
   self.busy = false
 end
 
-function M:negotiate(st, quote)
+-- ---- SELL -------------------------------------------------------------------
+function M:runSell()
   local d = self.d
+  d.remotes.trading_acceptinvite:FireServer()
+  local st = self:waitForOffer(d.cfg.tradeTimeoutSec)
+  if not st or not st.wantedSet then return self:abort("no wanted set") end
+  if d.gate and not d.gate(st.targetName) then return self:abort("gated: " .. tostring(st.targetName)) end
+
+  local feedEntry = d.feed[st.wantedSet]
+  local override = (d.cfg.items or {})[st.wantedSet] or {}
+  if override.forSale == false then return self:abort("not for sale: " .. st.wantedSet) end
+
+  local qty = st.targetQty or 1
+  local quote = pricing.quote(d.cfg, feedEntry or {}, override, qty)
+  if not quote then return self:abort("unpriceable: " .. st.wantedSet) end
+
+  self:addItem(st.wantedSet, qty)
+
   local start = os.time()
   for round = 0, (d.cfg.negotiation.maxRounds or 3) do
     local cur = d.getTradeState() or st
     local decision = negotiation.decide(d.cfg, quote, {
       offeredGems = cur.offeredGemsTarget,
       targetChatNumber = d.chat.lastNumberFrom(st.targetName),
-      round = round,
-      elapsed = os.time() - start,
+      round = round, elapsed = os.time() - start,
     })
     if decision.action == "ACCEPT" then
+      -- SCAM-GUARD: re-read the window and verify the offer still holds.
+      local thr = negotiation.threshold(d.cfg, quote, round)
+      local fresh = d.getTradeState() or cur
+      if not scamguard.safeToConfirmSell(thr, fresh.offeredGemsTarget) then
+        return self:abort("scam-guard: offer changed")
+      end
       d.remotes.trading_confirmtrade:FireServer()
-      d.log(("Confirmed %s x%d for %s")
-        :format(st.wantedSet, st.targetQty or 1, tostring(cur.offeredGemsTarget)))
+      local cost = (feedEntry and feedEntry.value or 0) * qty
+      if d.onSold then d.onSold(st.wantedSet, qty, fresh.offeredGemsTarget, cost) end
+      d.log(("Sold %s x%d for %s"):format(st.wantedSet, qty, tostring(fresh.offeredGemsTarget)))
       return
     elseif decision.action == "COUNTER" then
-      d.chat.send(decision.message)
-      task.wait(d.cfg.negotiation.chatCooldownSec or 4)
+      d.chat.send(decision.message); task.wait(d.cfg.negotiation.chatCooldownSec or 4)
     elseif decision.action == "ABORT" then
       return self:abort("negotiation failed")
-    else -- HOLD
+    else
       task.wait(2)
     end
-    if os.time() - start > (d.cfg.tradeTimeoutSec or 60) then
-      return self:abort("timeout")
-    end
+    if os.time() - start > (d.cfg.tradeTimeoutSec or 60) then return self:abort("timeout") end
   end
-  self:abort("max rounds")
+  return self:abort("max rounds")
 end
 
+-- ---- BUY (gem-cap mode) -----------------------------------------------------
+-- CONFIRM IN-GAME: the buy-side remote semantics (adding YOUR gems / accepting
+-- THEIR item). Static analysis only exposed sell-side remotes. The negotiation
+-- and safety structure is complete; the marked FireServer calls need confirming.
+function M:runBuy()
+  local d = self.d
+  d.remotes.trading_acceptinvite:FireServer()
+  local st = self:waitForOffer(d.cfg.tradeTimeoutSec)
+  if not st or not st.wantedSet then return self:abort("buy: no item offered") end
+  if d.gate and not d.gate(st.targetName) then return self:abort("gated: " .. tostring(st.targetName)) end
+
+  local wantEntry = (d.cfg.buy or {})[st.wantedSet]
+  if not wantEntry or not wantEntry.wantBuy then return self:abort("not on buy list: " .. st.wantedSet) end
+
+  local feedEntry = d.feed[st.wantedSet]
+  local qty = st.targetQty or 1
+  local bq = pricing.buyQuote(d.cfg, feedEntry or {}, wantEntry, qty)
+  if not bq then return self:abort("no buy price: " .. st.wantedSet) end
+
+  local start = os.time()
+  for round = 0, (d.cfg.negotiation.maxRounds or 3) do
+    local cur = d.getTradeState() or st
+    local decision = negotiation.decideBuy(d.cfg, bq, {
+      sellerAsk = cur.offeredGemsTarget,   -- gems the seller is asking of us
+      round = round, elapsed = os.time() - start,
+    })
+    if decision.action == "ACCEPT" then
+      local fresh = d.getTradeState() or cur
+      if not scamguard.safeToConfirmBuy(bq.max, fresh.offeredGemsTarget) then
+        return self:abort("scam-guard: seller raised price")
+      end
+      -- CONFIRM IN-GAME: add our gems / confirm the buy.
+      d.remotes.trading_confirmtrade:FireServer()
+      if d.onBought then d.onBought(st.wantedSet, qty, fresh.offeredGemsTarget) end
+      d.log(("Bought %s x%d for %s"):format(st.wantedSet, qty, tostring(fresh.offeredGemsTarget)))
+      return
+    elseif decision.action == "COUNTER" then
+      d.chat.send(decision.message); task.wait(d.cfg.negotiation.chatCooldownSec or 4)
+    elseif decision.action == "ABORT" then
+      return self:abort("buy negotiation failed")
+    else
+      task.wait(2)
+    end
+    if os.time() - start > (d.cfg.tradeTimeoutSec or 60) then return self:abort("timeout") end
+  end
+  return self:abort("buy max rounds")
+end
+
+-- ---- shared -----------------------------------------------------------------
 function M:addItem(setName, qty)
-  -- CONFIRM IN-GAME (Task 9): exact FireServer arg order for trading_additem.
-  -- Best guess from deob: (setName/class, qty).
+  -- CONFIRM IN-GAME (remotes task): exact FireServer arg order for trading_additem.
   self.d.remotes.trading_additem:FireServer(setName, qty)
 end
 
@@ -538,6 +916,31 @@ function M.build(deps)
       local s = deps.selected; if not s then return end
       cfg.items[s] = cfg.items[s] or {}
       cfg.items[s].value = tonumber(txt); save(cfg) end })
+
+  -- Auto-buyer (gem-cap mode)
+  tab:Toggle({ Title = "Auto-Buyer at Gem Cap", Value = cfg.buyEnabled,
+    Callback = function(v) cfg.buyEnabled = v; save(cfg) end })
+  tab:Input({ Title = "Gem Cap (default 100000000)",
+    Callback = function(txt) cfg.gemCap = tonumber(txt) or cfg.gemCap; save(cfg) end })
+  tab:Input({ Title = "Buy Discount % (default 10)",
+    Callback = function(txt) cfg.buyDiscountPct = tonumber(txt) or cfg.buyDiscountPct; save(cfg) end })
+  tab:Toggle({ Title = "Selected: Want to Buy", Value = false,
+    Callback = function(v)
+      local s = deps.selected; if not s then return end
+      cfg.buy[s] = cfg.buy[s] or {}; cfg.buy[s].wantBuy = v; save(cfg) end })
+
+  -- Safety / 24-7
+  tab:Input({ Title = "Player Cooldown (sec, default 30)",
+    Callback = function(txt) cfg.cooldownSec = tonumber(txt) or cfg.cooldownSec; save(cfg) end })
+  tab:Toggle({ Title = "Auto-Reconnect", Value = cfg.survival.autoReconnect,
+    Callback = function(v) cfg.survival.autoReconnect = v; save(cfg) end })
+  tab:Toggle({ Title = "Anti-AFK", Value = cfg.survival.antiAfk,
+    Callback = function(v) cfg.survival.antiAfk = v; save(cfg) end })
+
+  -- Discord webhook (easy-to-change text field; blank = off)
+  tab:Input({ Title = "Discord Webhook URL (blank = off)",
+    Callback = function(txt) cfg.webhook.url = txt or ""; save(cfg) end })
+
   return true
 end
 
@@ -554,44 +957,54 @@ local CONFIG = {
 local libConfig  = __M["lib.config"]
 local libFeed    = __M["lib.feed"]
 local libParse   = __M["lib.parse"]
+local capmode    = __M["lib.capmode"]
+local libStats   = __M["lib.stats"]
 local remotesM   = __M["runtime.remotes"]
 local persist    = __M["runtime.persist"]
 local inventory  = __M["runtime.inventory"]
 local TradeM     = __M["runtime.trade"]
 local advertiser = __M["runtime.advertiser"]
+local survival   = __M["runtime.survival"]
+local webhookSend= __M["runtime.webhook_send"]
+local cooldownLib= __M["lib.cooldown"]
 local ui         = __M["runtime.ui"]
 
 local function logp(t) print("[AutoTrade] " .. t) end
 
--- 1) settings (merge saved over defaults)
+-- 1) settings
 local cfg = libConfig.merge(libConfig.defaults(), persist.loadSettings() or {})
 
 -- 2) feed (fetch -> normalize -> cache; fall back to cache)
-local feed
-do
+local function fetchFeed()
   local ok, raw = pcall(function() return loadstring(game:HttpGet(CONFIG.feedUrl))() end)
   if ok and type(raw) == "table" then
-    feed = libFeed.normalize(raw); persist.saveFeedCache(raw)
-  else
-    feed = libFeed.normalize(persist.loadFeedCache() or {})
-    warn("[AutoTrade] feed fetch failed; using cache (" .. libFeed.count(feed) .. " items)")
+    persist.saveFeedCache(raw); return libFeed.normalize(raw)
   end
+  return nil
+end
+local feed = fetchFeed()
+if not feed then
+  feed = libFeed.normalize(persist.loadFeedCache() or {})
+  warn("[AutoTrade] feed fetch failed; using cache (" .. libFeed.count(feed) .. " items)")
 end
 
--- 3) make sure the base's own SmartTrade won't run, then load the base
+-- 3) disable base SmartTrade, then load the untouched base
 remotesM.disableBaseSmartTradeFile()
-local okBase = remotesM.loadBase(CONFIG.baseUrl)
-if not okBase then warn("[AutoTrade] base failed to load") end
+if not remotesM.loadBase(CONFIG.baseUrl) then warn("[AutoTrade] base failed to load") end
 
 -- 4) resolve remotes
 local remotes, rerr = remotesM.resolveRemotes(30)
 if not remotes then warn("[AutoTrade] " .. tostring(rerr)); return end
 
--- 5) chat adapter (records last number each player typed; sends counters)
+-- 5) webhook + stats
+local statsObj = persist.loadStats() or libStats.new(os.time())
+local function onEvent(event, data) pcall(webhookSend.send, cfg, event, data) end
+
+-- 6) chat adapter
 local chatState = {}
 do
   local TextChatService = game:GetService("TextChatService")
-  local ok = pcall(function()
+  pcall(function()
     TextChatService:WaitForChild("TextChannels", 10):WaitForChild("RBXGeneral", 10)
     TextChatService.MessageReceived:Connect(function(msg)
       local who = msg.TextSource and msg.TextSource.Name
@@ -599,27 +1012,55 @@ do
       if who and n then chatState[who] = n end
     end)
   end)
-  if not ok then warn("[AutoTrade] chat hook failed") end
 end
 local chat = {
   send = function(text) advertiser.sendChat(text) end,
   lastNumberFrom = function(name) return chatState[name] end,
 }
 
--- 6) trade-state accessor (maps the live game trade object).
--- CONFIRM IN-GAME (Task 9/11): locate the real trade-state source and set the
--- fields { offeredGemsTarget, offeredItemsTarget, targetName, targetQty,
--- wantedSet, pendingInvite }. Placeholder reads a global the in-game pass sets.
-local function getTradeState()
-  return _G.__OdRestoTradeState
+-- 7) trade-state accessor + gem balance. CONFIRM IN-GAME (Task 9/11): map these
+-- to the live game objects. Placeholders read globals the in-game pass sets.
+local function getTradeState() return _G.__OdRestoTradeState end
+local function getGems() return tonumber(_G.__OdRestoGems) or 0 end
+
+-- 8) per-player cooldown/blocklist gate (stamps on accept)
+local cooldownState = {}
+local function gate(name)
+  local now = os.time()
+  local ok = cooldownLib.allow(cfg, name, cooldownState[name], now)
+  if ok then cooldownState[name] = now end
+  return ok
 end
 
--- 7) wire trade runner to invite events
+-- 9) sell/buy mode with hysteresis; fire "cap" webhook on the sell->buy edge
+local lastMode = "sell"
+local function mode()
+  local gems = getGems()
+  local m = capmode.mode(cfg, gems, lastMode)
+  if m == "buy" and lastMode ~= "buy" then onEvent("cap", { gems = gems }) end
+  lastMode = m
+  return m
+end
+
+-- 10) stats callbacks
+local function onSold(item, qty, gems, cost)
+  libStats.recordSell(statsObj, gems, cost)
+  persist.saveStats(statsObj)
+  onEvent("sale", { item = item, qty = qty, gems = gems, profit = gems - cost })
+end
+local function onBought(item, qty, gems)
+  libStats.recordBuy(statsObj, gems)
+  persist.saveStats(statsObj)
+  onEvent("buy", { item = item, qty = qty, gems = gems })
+end
+
+-- 11) trade runner + invite loop (under the watchdog)
 local runner = TradeM.new({
   remotes = remotes, cfg = cfg, feed = feed, chat = chat,
   getTradeState = getTradeState, log = logp,
+  mode = mode, gate = gate, onSold = onSold, onBought = onBought,
 })
-task.spawn(function()
+survival.watchdog(cfg, "invite-loop", function()
   while true do
     if cfg.enabled then
       local st = getTradeState()
@@ -627,16 +1068,34 @@ task.spawn(function()
     end
     task.wait(1)
   end
-end)
+end, onEvent)
 
--- 8) advertiser
+-- 12) survival: anti-afk + reconnect
+survival.startAntiAfk(cfg)
+survival.startReconnect(cfg, onEvent)
+
+-- 13) advertiser
 advertiser.start({ cfg = cfg, feed = feed, ownedFn = inventory.owned, log = logp })
 
--- 9) UI (attach to base window; CONFIRM IN-GAME: window/tab handle from base)
+-- 14) periodic feed refresh
+if (cfg.feedRefreshSec or 0) > 0 then
+  task.spawn(function()
+    while true do
+      task.wait(cfg.feedRefreshSec)
+      local fresh = fetchFeed()
+      if fresh then for k in pairs(feed) do feed[k] = nil end
+        for k, v in pairs(fresh) do feed[k] = v end
+        logp("feed refreshed (" .. libFeed.count(feed) .. " items)")
+      end
+    end
+  end)
+end
+
+-- 15) UI
 pcall(function()
   ui.build({ window = _G.__OdRestoWindow, cfg = cfg, feed = feed,
-             save = persist.saveSettings, onToggleEnabled = function() end })
+             save = persist.saveSettings, stats = statsObj, onToggleEnabled = function() end })
 end)
 
-logp("ready (" .. libFeed.count(feed) .. " items).")
-
+logp("ready (" .. libFeed.count(feed) .. " items). buyer=" .. tostring(cfg.buyEnabled)
+     .. " cap=" .. tostring(cfg.gemCap))
