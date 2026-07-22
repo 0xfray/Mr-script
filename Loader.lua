@@ -2,7 +2,7 @@ local HttpGet = game.HttpGet
 local PlaceId = game.PlaceId
 
 local success, Games = pcall(function()
-    return loadstring(HttpGet(game, "https://raw.githubusercontent.com/ditampol-tzuyoon/Ohdear/refs/heads/main/GameList.lua"))()
+    return loadstring(HttpGet(game, "https://raw.githubusercontent.com/0xfray/Mr-script/refs/heads/main/GameList.lua"))()
 end)
 
 if not success or not Games then
