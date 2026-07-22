@@ -870,78 +870,103 @@ end)()
 __M["runtime.ui"] = (function()
 local M = {}
 
--- deps: { window, cfg, feed, save, onToggleEnabled }
--- window: a WindUI Tab handle exposed by main (built from the base's WindUI global).
--- CONFIRM IN-GAME: exact WindUI element method names/signatures (Task 13 checklist).
+local WINDUI_URL = "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
+
+-- Build a self-contained WindUI window for the layer. Independent of the base
+-- (the base's own window handle is locked inside its obfuscated VM).
+-- deps: { cfg, feed, save, stats, onToggleEnabled }
+-- Returns the window handle (with :setStatus) or nil on failure.
 function M.build(deps)
   local cfg, save = deps.cfg, deps.save
-  local tab = deps.window
-  if not tab then return false end
-  deps.selected = nil
+  local ok, WindUI = pcall(function()
+    return loadstring(game:HttpGet(WINDUI_URL))()
+  end)
+  if not ok or not WindUI then return nil end
 
-  tab:Toggle({ Title = "Enable Universal Auto-Trade", Value = cfg.enabled,
-    Callback = function(v) cfg.enabled = v; save(cfg); deps.onToggleEnabled(v) end })
+  local Window = WindUI:CreateWindow({
+    Title = "Universal Auto-Trade",
+    Icon = "arrows-exchange",
+    Author = "by 0xfray",
+    Folder = "OdResto",
+    Size = UDim2.fromOffset(580, 520),
+    Transparent = true,
+    Theme = "Dark",
+  })
 
-  tab:Slider({ Title = "Global Markup %", Value = { Min = 0, Max = 50, Default = cfg.globalMarkupPct },
+  local Main = Window:Tab({ Title = "Auto-Trade", Icon = "coins" })
+  local Items = Window:Tab({ Title = "Items", Icon = "list" })
+  local Safety = Window:Tab({ Title = "24/7 & Safety", Icon = "shield" })
+
+  local statusParagraph = Main:Paragraph({
+    Title = "Status", Desc = "Idle - not enabled.",
+  })
+
+  -- ---- Main tab ----
+  Main:Toggle({ Title = "Enable Universal Auto-Trade", Value = cfg.enabled,
+    Callback = function(v) cfg.enabled = v; save(cfg); if deps.onToggleEnabled then deps.onToggleEnabled(v) end end })
+  Main:Slider({ Title = "Global Markup %", Step = 1,
+    Value = { Min = 0, Max = 50, Default = cfg.globalMarkupPct },
     Callback = function(v) cfg.globalMarkupPct = v; save(cfg) end })
-  tab:Slider({ Title = "Negotiation Band %", Value = { Min = 0, Max = 30, Default = cfg.bandPct },
+  Main:Slider({ Title = "Negotiation Band %", Step = 1,
+    Value = { Min = 0, Max = 30, Default = cfg.bandPct },
     Callback = function(v) cfg.bandPct = v; save(cfg) end })
-  tab:Toggle({ Title = "Demand Scaling", Value = cfg.demandScaling,
+  Main:Toggle({ Title = "Demand Scaling", Value = cfg.demandScaling,
     Callback = function(v) cfg.demandScaling = v; save(cfg) end })
-
-  tab:Dropdown({ Title = "Trade Unit Mode",
+  Main:Dropdown({ Title = "Trade Unit Mode",
     Values = { "single_copy", "single_type_qty", "multi_basket" },
     Value = cfg.tradeUnitMode,
     Callback = function(v) cfg.tradeUnitMode = v; save(cfg) end })
-
-  tab:Toggle({ Title = "Rotating Chat Ads", Value = cfg.ads.rotatingAds,
+  Main:Toggle({ Title = "Rotating Chat Ads", Value = cfg.ads.rotatingAds,
     Callback = function(v) cfg.ads.rotatingAds = v; save(cfg) end })
-  tab:Toggle({ Title = "Auto-Invite Nearby", Value = cfg.ads.autoInvite,
+  Main:Toggle({ Title = "Auto-Invite Nearby", Value = cfg.ads.autoInvite,
     Callback = function(v) cfg.ads.autoInvite = v; save(cfg) end })
-  tab:Toggle({ Title = "Ads: In-Stock Only", Value = cfg.ads.stockOnly,
+  Main:Toggle({ Title = "Ads: In-Stock Only", Value = cfg.ads.stockOnly,
     Callback = function(v) cfg.ads.stockOnly = v; save(cfg) end })
 
-  -- Per-item for-sale + override: searchable list.
+  -- ---- Items tab (per-item for-sale + overrides) ----
   local names = {}
   for name in pairs(deps.feed) do names[#names + 1] = name end
   table.sort(names)
-  tab:Dropdown({ Title = "Select Item to Configure", Values = names, Value = names[1],
-    Callback = function(sel) deps.selected = sel end })
-  tab:Toggle({ Title = "Selected: For Sale", Value = false,
+  local selected = names[1]
+  Items:Dropdown({ Title = "Select Item", Values = names, Value = names[1],
+    Callback = function(sel) selected = sel end })
+  Items:Toggle({ Title = "Selected: For Sale", Value = false,
     Callback = function(v)
-      local s = deps.selected; if not s then return end
-      cfg.items[s] = cfg.items[s] or {}; cfg.items[s].forSale = v; save(cfg) end })
-  tab:Input({ Title = "Selected: Price Override (blank = use value)",
+      if not selected then return end
+      cfg.items[selected] = cfg.items[selected] or {}
+      cfg.items[selected].forSale = v; save(cfg) end })
+  Items:Input({ Title = "Selected: Price Override (blank = use value)",
     Callback = function(txt)
-      local s = deps.selected; if not s then return end
-      cfg.items[s] = cfg.items[s] or {}
-      cfg.items[s].value = tonumber(txt); save(cfg) end })
-
-  -- Auto-buyer (gem-cap mode)
-  tab:Toggle({ Title = "Auto-Buyer at Gem Cap", Value = cfg.buyEnabled,
-    Callback = function(v) cfg.buyEnabled = v; save(cfg) end })
-  tab:Input({ Title = "Gem Cap (default 100000000)",
-    Callback = function(txt) cfg.gemCap = tonumber(txt) or cfg.gemCap; save(cfg) end })
-  tab:Input({ Title = "Buy Discount % (default 10)",
-    Callback = function(txt) cfg.buyDiscountPct = tonumber(txt) or cfg.buyDiscountPct; save(cfg) end })
-  tab:Toggle({ Title = "Selected: Want to Buy", Value = false,
+      if not selected then return end
+      cfg.items[selected] = cfg.items[selected] or {}
+      cfg.items[selected].value = tonumber(txt); save(cfg) end })
+  Items:Toggle({ Title = "Selected: Want to Buy (cap mode)", Value = false,
     Callback = function(v)
-      local s = deps.selected; if not s then return end
-      cfg.buy[s] = cfg.buy[s] or {}; cfg.buy[s].wantBuy = v; save(cfg) end })
+      if not selected then return end
+      cfg.buy[selected] = cfg.buy[selected] or {}
+      cfg.buy[selected].wantBuy = v; save(cfg) end })
 
-  -- Safety / 24-7
-  tab:Input({ Title = "Player Cooldown (sec, default 30)",
+  -- ---- Safety / 24-7 tab ----
+  Safety:Toggle({ Title = "Auto-Buyer at Gem Cap", Value = cfg.buyEnabled,
+    Callback = function(v) cfg.buyEnabled = v; save(cfg) end })
+  Safety:Input({ Title = "Gem Cap (default 100000000)",
+    Callback = function(txt) cfg.gemCap = tonumber(txt) or cfg.gemCap; save(cfg) end })
+  Safety:Input({ Title = "Buy Discount % (default 10)",
+    Callback = function(txt) cfg.buyDiscountPct = tonumber(txt) or cfg.buyDiscountPct; save(cfg) end })
+  Safety:Input({ Title = "Player Cooldown sec (default 30)",
     Callback = function(txt) cfg.cooldownSec = tonumber(txt) or cfg.cooldownSec; save(cfg) end })
-  tab:Toggle({ Title = "Auto-Reconnect", Value = cfg.survival.autoReconnect,
+  Safety:Toggle({ Title = "Auto-Reconnect", Value = cfg.survival.autoReconnect,
     Callback = function(v) cfg.survival.autoReconnect = v; save(cfg) end })
-  tab:Toggle({ Title = "Anti-AFK", Value = cfg.survival.antiAfk,
+  Safety:Toggle({ Title = "Anti-AFK", Value = cfg.survival.antiAfk,
     Callback = function(v) cfg.survival.antiAfk = v; save(cfg) end })
-
-  -- Discord webhook (easy-to-change text field; blank = off)
-  tab:Input({ Title = "Discord Webhook URL (blank = off)",
+  Safety:Input({ Title = "Discord Webhook URL (blank = off)",
     Callback = function(txt) cfg.webhook.url = txt or ""; save(cfg) end })
 
-  return true
+  local handle = { window = Window, status = statusParagraph }
+  function handle.setStatus(text)
+    pcall(function() statusParagraph:SetDesc(text) end)
+  end
+  return handle
 end
 
 return M
@@ -988,23 +1013,39 @@ if not feed then
   warn("[AutoTrade] feed fetch failed; using cache (" .. libFeed.count(feed) .. " items)")
 end
 
--- 3) disable base SmartTrade, then load the untouched base
-remotesM.disableBaseSmartTradeFile()
-if not remotesM.loadBase(CONFIG.baseUrl) then warn("[AutoTrade] base failed to load") end
-
--- 4) resolve remotes
-local remotes, rerr = remotesM.resolveRemotes(30)
-if not remotes then warn("[AutoTrade] " .. tostring(rerr)); return end
-
--- 5) webhook + stats
+-- 3) stats + webhook
 local statsObj = persist.loadStats() or libStats.new(os.time())
 local function onEvent(event, data) pcall(webhookSend.send, cfg, event, data) end
 
--- 6) chat adapter
-local chatState = {}
-do
-  local TextChatService = game:GetService("TextChatService")
+-- 4) BUILD UI EARLY so the panel always appears (independent of the base/remotes)
+local uiHandle = ui.build({ cfg = cfg, feed = feed, save = persist.saveSettings,
+                            stats = statsObj, onToggleEnabled = function() end })
+if uiHandle then logp("panel loaded (" .. libFeed.count(feed) .. " items)")
+else warn("[AutoTrade] WindUI panel failed to load") end
+local function setStatus(t) if uiHandle and uiHandle.setStatus then uiHandle.setStatus(t) end end
+setStatus("Loading base + remotes...")
+
+-- 5) disable base SmartTrade, then load the untouched base
+remotesM.disableBaseSmartTradeFile()
+if not remotesM.loadBase(CONFIG.baseUrl) then warn("[AutoTrade] base failed to load") end
+
+-- 6) resolve remotes (does NOT block the UI if it fails)
+local remotes, rerr = remotesM.resolveRemotes(30)
+if not remotes then
+  warn("[AutoTrade] " .. tostring(rerr))
+  setStatus("Remotes not found: " .. tostring(rerr) .. ". UI only.")
+end
+
+-- 7) survival works regardless of remotes
+survival.startAntiAfk(cfg)
+survival.startReconnect(cfg, onEvent)
+
+-- 8) trading wiring (only when remotes resolved)
+if remotes then
+  -- chat adapter
+  local chatState = {}
   pcall(function()
+    local TextChatService = game:GetService("TextChatService")
     TextChatService:WaitForChild("TextChannels", 10):WaitForChild("RBXGeneral", 10)
     TextChatService.MessageReceived:Connect(function(msg)
       local who = msg.TextSource and msg.TextSource.Name
@@ -1012,78 +1053,70 @@ do
       if who and n then chatState[who] = n end
     end)
   end)
-end
-local chat = {
-  send = function(text) advertiser.sendChat(text) end,
-  lastNumberFrom = function(name) return chatState[name] end,
-}
+  local chat = {
+    send = function(text) advertiser.sendChat(text) end,
+    lastNumberFrom = function(name) return chatState[name] end,
+  }
 
--- 7) trade-state accessor + gem balance. CONFIRM IN-GAME (Task 9/11): map these
--- to the live game objects. Placeholders read globals the in-game pass sets.
-local function getTradeState() return _G.__OdRestoTradeState end
-local function getGems() return tonumber(_G.__OdRestoGems) or 0 end
+  -- CONFIRM IN-GAME: map to the live game objects (placeholders for now).
+  local function getTradeState() return _G.__OdRestoTradeState end
+  local function getGems() return tonumber(_G.__OdRestoGems) or 0 end
 
--- 8) per-player cooldown/blocklist gate (stamps on accept)
-local cooldownState = {}
-local function gate(name)
-  local now = os.time()
-  local ok = cooldownLib.allow(cfg, name, cooldownState[name], now)
-  if ok then cooldownState[name] = now end
-  return ok
-end
-
--- 9) sell/buy mode with hysteresis; fire "cap" webhook on the sell->buy edge
-local lastMode = "sell"
-local function mode()
-  local gems = getGems()
-  local m = capmode.mode(cfg, gems, lastMode)
-  if m == "buy" and lastMode ~= "buy" then onEvent("cap", { gems = gems }) end
-  lastMode = m
-  return m
-end
-
--- 10) stats callbacks
-local function onSold(item, qty, gems, cost)
-  libStats.recordSell(statsObj, gems, cost)
-  persist.saveStats(statsObj)
-  onEvent("sale", { item = item, qty = qty, gems = gems, profit = gems - cost })
-end
-local function onBought(item, qty, gems)
-  libStats.recordBuy(statsObj, gems)
-  persist.saveStats(statsObj)
-  onEvent("buy", { item = item, qty = qty, gems = gems })
-end
-
--- 11) trade runner + invite loop (under the watchdog)
-local runner = TradeM.new({
-  remotes = remotes, cfg = cfg, feed = feed, chat = chat,
-  getTradeState = getTradeState, log = logp,
-  mode = mode, gate = gate, onSold = onSold, onBought = onBought,
-})
-survival.watchdog(cfg, "invite-loop", function()
-  while true do
-    if cfg.enabled then
-      local st = getTradeState()
-      if st and st.pendingInvite then runner:handleInvite() end
-    end
-    task.wait(1)
+  local cooldownState = {}
+  local function gate(name)
+    local now = os.time()
+    local okg = cooldownLib.allow(cfg, name, cooldownState[name], now)
+    if okg then cooldownState[name] = now end
+    return okg
   end
-end, onEvent)
 
--- 12) survival: anti-afk + reconnect
-survival.startAntiAfk(cfg)
-survival.startReconnect(cfg, onEvent)
+  local lastMode = "sell"
+  local function mode()
+    local gems = getGems()
+    local m = capmode.mode(cfg, gems, lastMode)
+    if m == "buy" and lastMode ~= "buy" then onEvent("cap", { gems = gems }) end
+    lastMode = m
+    return m
+  end
 
--- 13) advertiser
-advertiser.start({ cfg = cfg, feed = feed, ownedFn = inventory.owned, log = logp })
+  local function onSold(item, qty, gems, cost)
+    libStats.recordSell(statsObj, gems, cost); persist.saveStats(statsObj)
+    onEvent("sale", { item = item, qty = qty, gems = gems, profit = gems - cost })
+    setStatus(("Sold %s x%d for %s"):format(item, qty, tostring(gems)))
+  end
+  local function onBought(item, qty, gems)
+    libStats.recordBuy(statsObj, gems); persist.saveStats(statsObj)
+    onEvent("buy", { item = item, qty = qty, gems = gems })
+    setStatus(("Bought %s x%d for %s"):format(item, qty, tostring(gems)))
+  end
 
--- 14) periodic feed refresh
+  local runner = TradeM.new({
+    remotes = remotes, cfg = cfg, feed = feed, chat = chat,
+    getTradeState = getTradeState, log = logp,
+    mode = mode, gate = gate, onSold = onSold, onBought = onBought,
+  })
+  survival.watchdog(cfg, "invite-loop", function()
+    while true do
+      if cfg.enabled then
+        local st = getTradeState()
+        if st and st.pendingInvite then runner:handleInvite() end
+      end
+      task.wait(1)
+    end
+  end, onEvent)
+
+  advertiser.start({ cfg = cfg, feed = feed, ownedFn = inventory.owned, log = logp })
+  setStatus("Ready. Trading " .. (cfg.enabled and "ENABLED" or "disabled") .. ".")
+end
+
+-- 9) periodic feed refresh
 if (cfg.feedRefreshSec or 0) > 0 then
   task.spawn(function()
     while true do
       task.wait(cfg.feedRefreshSec)
       local fresh = fetchFeed()
-      if fresh then for k in pairs(feed) do feed[k] = nil end
+      if fresh then
+        for k in pairs(feed) do feed[k] = nil end
         for k, v in pairs(fresh) do feed[k] = v end
         logp("feed refreshed (" .. libFeed.count(feed) .. " items)")
       end
@@ -1091,11 +1124,6 @@ if (cfg.feedRefreshSec or 0) > 0 then
   end)
 end
 
--- 15) UI
-pcall(function()
-  ui.build({ window = _G.__OdRestoWindow, cfg = cfg, feed = feed,
-             save = persist.saveSettings, stats = statsObj, onToggleEnabled = function() end })
-end)
-
 logp("ready (" .. libFeed.count(feed) .. " items). buyer=" .. tostring(cfg.buyEnabled)
      .. " cap=" .. tostring(cfg.gemCap))
+
