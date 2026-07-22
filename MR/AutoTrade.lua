@@ -1009,9 +1009,11 @@ function M:handle(invite)
 end
 
 function M:accept(invite)
-  local uid = type(invite) == "table" and (invite.uid or invite.Uid or invite.id) or invite
-  self.d.remotes.trading_acceptinvite:FireServer(uid)
-  self.d.log("accepted invite uid=" .. tostring(uid))
+  -- Accept with the inviter Player object (the invite entry carries `.inviter`);
+  -- fall back to a uid if that's all we have.
+  local who = (type(invite) == "table" and (invite.player or invite.uid)) or invite
+  self.d.remotes.trading_acceptinvite:FireServer(who)
+  self.d.log("accepted invite (" .. tostring(self.d and invite and invite.name or who) .. ")")
 end
 
 -- Wait until a live activeTrade object exists.
@@ -1031,9 +1033,6 @@ function M:runSell(invite)
   self:accept(invite)
   local at = self:waitForTrade(d.cfg.tradeTimeoutSec)
   if not at then return self:abort("no active trade after accept") end
-  local partner = at.targetID or (type(invite) == "table" and invite.uid)
-  if d.gate and not d.gate(partner) then return self:abort("gated: " .. tostring(partner)) end
-
   local setName = d.pickSellItem and d.pickSellItem(at)
   if not setName then return self:abort("no sellable item selected (mark one For Sale)") end
 
@@ -1086,9 +1085,6 @@ function M:runBuy(invite)
   self:accept(invite)
   local at = self:waitForTrade(d.cfg.tradeTimeoutSec)
   if not at then return self:abort("buy: no active trade") end
-  local partner = at.targetID or (type(invite) == "table" and invite.uid)
-  if d.gate and not d.gate(partner) then return self:abort("gated: " .. tostring(partner)) end
-
   local setName = d.pickBuyItem and d.pickBuyItem(at)
   if not setName then return self:abort("buy: item not on buy list") end
   local feedEntry = d.feed[setName]
@@ -1483,41 +1479,38 @@ if remotes and rroot then
     log = logp, mode = mode, gate = gate, onSold = onSold, onBought = onBought,
   })
 
-  -- Process a status object: cache it, dump shapes once, accept new invites.
-  local seenInv = {}
+  -- Single gated entry point for accepting an invite. gate() dedups both the
+  -- poll path and the event path (per-player cooldown), so no double-processing.
+  local function playerName(p)
+    if type(p) == "userdata" then local ok, n = pcall(function() return p.Name end); return ok and n or "?" end
+    return tostring(p)
+  end
+  local function tryHandleInvite(uid, player)
+    if not cfg.enabled or not uid then return end
+    if not gate(uid) then return end -- cooldown / dedup
+    logp(("HANDLING invite from %s uid=%s"):format(playerName(player), tostring(uid)))
+    runner:handle({ uid = uid, player = player, name = playerName(player) })
+  end
+
+  -- Cache status; accept invites from incomingInvites (entry = {inviter,target,timestamp}).
   local function processStatus(s)
     if type(s) ~= "table" then return end
     latestStatus = s
     if not dumpedStatus then
       dumpedStatus = true
-      -- trimmed dump (skip the huge `history` list)
-      logDump("status (trimmed)", {
-        activeTrade = s.activeTrade, incomingInvites = s.incomingInvites,
-        outgoingInvites = s.outgoingInvites,
-      })
+      logDump("status (trimmed)", { activeTrade = s.activeTrade, incomingInvites = s.incomingInvites, outgoingInvites = s.outgoingInvites })
     end
     if type(s.activeTrade) == "table" and not dumpedAT then dumpedAT = true; logDump("activeTrade fields", s.activeTrade) end
     local inv = s.incomingInvites
     if type(inv) == "table" then
-      local present = {}
       for uid, entry in pairs(inv) do
-        present[uid] = true
-        if not seenInv[uid] then
-          seenInv[uid] = true
-          if not dumpedInvite then dumpedInvite = true; logDump("incomingInvites entry", (type(entry) == "table" and entry) or { value = entry }) end
-          if cfg.enabled then
-            local invite = (type(entry) == "table" and entry) or {}
-            invite.uid = invite.uid or uid
-            logp("PROCESSING invite uid=" .. tostring(invite.uid))
-            runner:handle(invite)
-          end
-        end
+        if not dumpedInvite then dumpedInvite = true; logDump("incomingInvites entry", (type(entry) == "table" and entry) or { value = entry }) end
+        local player = (type(entry) == "table" and (entry.inviter or entry.player)) or nil
+        tryHandleInvite(uid, player)
       end
-      for uid in pairs(seenInv) do if not present[uid] then seenInv[uid] = nil end end
     end
   end
 
-  -- Status arrives two ways: events and polling. Both feed processStatus.
   local function connectStatus(name)
     local r = remotes[name]
     if r and r.OnClientEvent then
@@ -1527,7 +1520,7 @@ if remotes and rroot then
   end
   connectStatus("trading_statuschange"); connectStatus("trading_tradebegan")
 
-  -- Invites arrive here as a Player (not in incomingInvites). Accept from this.
+  -- Event path: inviter arrives as a Player. Funnel through the same gate.
   local dumpedInviteEvt = false
   if remotes.trading_invitesent then
     remotes.trading_invitesent.OnClientEvent:Connect(function(...)
@@ -1535,22 +1528,15 @@ if remotes and rroot then
       if not dumpedInviteEvt then dumpedInviteEvt = true; logDump("trading_invitesent args", args) end
       local a = args[1]
       local inviter = (type(a) == "table" and a[1]) or a
-      local uid, name
-      if type(inviter) == "userdata" then
-        pcall(function() uid = inviter.UserId; name = inviter.Name end)
-      elseif type(inviter) == "table" then
-        uid = inviter.uid or inviter.id or inviter.UserId; name = inviter.name or inviter.Name
-      else
-        uid = inviter
-      end
-      logp(("INVITE from %s uid=%s enabled=%s"):format(tostring(name), tostring(uid), tostring(cfg.enabled)))
-      if cfg.enabled and gate(uid) then
-        runner:handle({ uid = uid, name = name, player = inviter })
-      end
+      local uid
+      if type(inviter) == "userdata" then pcall(function() uid = inviter.UserId end)
+      elseif type(inviter) == "table" then uid = inviter.uid or inviter.id or inviter.UserId
+      else uid = inviter end
+      tryHandleInvite(uid, inviter)
     end)
-    logok("listening on trading_invitesent (accepts on invite)")
+    logok("listening on trading_invitesent")
   else
-    logwarn("trading_invitesent absent - cannot detect invites")
+    logwarn("trading_invitesent absent")
   end
 
   -- Poll getStatus as the reliable driver (matches the base's polling model).
