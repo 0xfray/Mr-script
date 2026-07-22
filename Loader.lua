@@ -65,6 +65,9 @@ local M = {}
 function M.defaults()
   return {
     enabled = false,
+    testMode = true,          -- do everything but never press confirm (safe)
+    activeVendItem = "",      -- the ONE item the bot sells (blank = highest-value For Sale)
+    minSellPct = 90,          -- hard floor: never confirm a sale below value * this%
     globalMarkupPct = 5,      -- ask = value * (1 + markup/100)
     bandPct = 10,             -- ceiling/floor = value * (1 +/- band/100)
     demandScaling = true,     -- high demand -> more markup, less concession
@@ -561,6 +564,59 @@ end
 return M
 
 end)()
+__M["lib.tradefields"] = (function()
+-- Robust readers for the live activeTrade object. The game's exact field names
+-- aren't fully confirmed, so we try known names first, then fuzzy-scan by keyword.
+-- Each reader returns (value, fieldNameUsed) so the caller can log what matched.
+local M = {}
+
+local function firstKnown(at, names)
+  for _, k in ipairs(names) do
+    local v = tonumber(at[k])
+    if v then return v, k end
+  end
+  return nil
+end
+
+local function fuzzyNumeric(at, mustA, mustB)
+  for k, v in pairs(at) do
+    if type(k) == "string" and type(v) == "number" then
+      local lk = k:lower()
+      if lk:find(mustA) and (not mustB or lk:find(mustB)) then return v, k end
+    end
+  end
+  return nil
+end
+
+-- Gems the buyer (target/other player) has put into the window.
+function M.buyerGems(at)
+  if type(at) ~= "table" then return 0, nil end
+  local v, k = firstKnown(at, { "sentGemsTarget", "offeredGemsTarget", "gemsTarget", "targetGems" })
+  if v then return v, k end
+  v, k = fuzzyNumeric(at, "gem", "target")
+  if v then return v, k end
+  return 0, nil
+end
+
+-- Gems we (the player) have put in.
+function M.myGems(at)
+  if type(at) ~= "table" then return 0, nil end
+  local v, k = firstKnown(at, { "sentGemsPlayer", "offeredGemsPlayer", "gemsPlayer", "playerGems" })
+  if v then return v, k end
+  v, k = fuzzyNumeric(at, "gem", "player")
+  if v then return v, k end
+  return 0, nil
+end
+
+-- The other player's user id.
+function M.partnerId(at)
+  if type(at) ~= "table" then return nil end
+  return at.targetID or at.targetId or at.partnerID or at.otherID or at.otherId
+end
+
+return M
+
+end)()
 __M["runtime.persist"] = (function()
 -- Executor file persistence. All calls guarded: features degrade, never crash.
 local HttpService = game:GetService("HttpService")
@@ -980,19 +1036,23 @@ __M["runtime.trade"] = (function()
 local pricing = __M["lib.pricing"]
 local negotiation = __M["lib.negotiation"]
 local scamguard = __M["lib.scamguard"]
+local tf = __M["lib.tradefields"]
 
 local M = {}
 
--- Gems the buyer (target) has put into the window. This game uses
--- `sentGemsTarget` (confirmed from the trade-history dump); fall back to the
--- older `offeredGemsTarget` just in case.
-local function buyerGems(at)
-  return tonumber(at and (at.sentGemsTarget or at.offeredGemsTarget)) or 0
-end
-
 -- deps: { remotes, cfg, feed, catalog, getActiveTrade, pickSellItem, pickBuyItem,
---         sendTradeMsg, log, mode, gate, onSold, onBought }
-function M.new(deps) return setmetatable({ d = deps, busy = false }, { __index = M }) end
+--         sendTradeMsg, log, mode, onSold, onBought }
+function M.new(deps) return setmetatable({ d = deps, busy = false, loggedField = false }, { __index = M }) end
+
+-- Robust buyer-gems read; logs which field matched, once.
+function M:buyerGems(at)
+  local g, field = tf.buyerGems(at)
+  if field and not self.loggedField then
+    self.loggedField = true
+    self.d.log("buyer-gems field = '" .. tostring(field) .. "'")
+  end
+  return g
+end
 
 function M:handle(invite)
   if self.busy then return end
@@ -1009,14 +1069,11 @@ function M:handle(invite)
 end
 
 function M:accept(invite)
-  -- Accept with the inviter Player object (the invite entry carries `.inviter`);
-  -- fall back to a uid if that's all we have.
   local who = (type(invite) == "table" and (invite.player or invite.uid)) or invite
   self.d.remotes.trading_acceptinvite:FireServer(who)
-  self.d.log("accepted invite (" .. tostring(self.d and invite and invite.name or who) .. ")")
+  self.d.log("accepted invite (" .. tostring((type(invite) == "table" and invite.name) or who) .. ")")
 end
 
--- Wait until a live activeTrade object exists.
 function M:waitForTrade(timeout)
   local start = os.time()
   repeat
@@ -1033,44 +1090,54 @@ function M:runSell(invite)
   self:accept(invite)
   local at = self:waitForTrade(d.cfg.tradeTimeoutSec)
   if not at then return self:abort("no active trade after accept") end
+
   local setName = d.pickSellItem and d.pickSellItem(at)
-  if not setName then return self:abort("no sellable item selected (mark one For Sale)") end
+  if not setName then return self:abort("no vend item set (pick an Active Vend Item / mark one For Sale)") end
 
   local feedEntry = d.feed[setName]
   local override = (d.cfg.items or {})[setName] or {}
-  if override.forSale == false then return self:abort("not for sale: " .. setName) end
-  local qty = 1
-  local quote = pricing.quote(d.cfg, feedEntry or {}, override, qty)
+  local quote = pricing.quote(d.cfg, feedEntry or {}, override, 1)
   if not quote then return self:abort("unpriceable: " .. setName) end
 
-  self:addItem(setName, qty)
-  d.log(("selling %s, want >= %s gems (buyer has %s)"):format(setName, tostring(quote.floor), tostring(buyerGems(at))))
+  -- HARD FLOOR from the real market value, independent of any override.
+  local marketVal = feedEntry and tonumber(feedEntry.value)
+  local hardFloor = marketVal and math.floor(marketVal * (d.cfg.minSellPct or 90) / 100) or quote.floor
+
+  self:addItem(setName, 1)
   if d.sendTradeMsg then
     d.sendTradeMsg(("Selling %s for %s gems - add gems and confirm!"):format(setName, tostring(quote.ask)))
   end
+  d.log(("SELL %s | ask %s ceiling %s floor %s hardFloor %s | buyer has %s")
+    :format(setName, tostring(quote.ask), tostring(quote.ceiling), tostring(quote.floor), tostring(hardFloor), tostring(self:buyerGems(at))))
 
   local start = os.time()
   for round = 0, (d.cfg.negotiation.maxRounds or 3) do
     local cur = d.getActiveTrade() or at
-    local decision = negotiation.decide(d.cfg, quote, {
-      offeredGems = buyerGems(cur), targetChatNumber = nil,
-      round = round, elapsed = os.time() - start,
-    })
+    local bg = self:buyerGems(cur)
+    local decision = negotiation.decide(d.cfg, quote, { offeredGems = bg, round = round, elapsed = os.time() - start })
+    d.log(("round %d: buyer=%s decision=%s"):format(round, tostring(bg), decision.action))
+
     if decision.action == "ACCEPT" then
-      local thr = negotiation.threshold(d.cfg, quote, round)
       local fresh = d.getActiveTrade() or cur
-      if not scamguard.safeToConfirmSell(thr, buyerGems(fresh)) then
-        return self:abort("scam-guard: offer changed (" .. tostring(buyerGems(fresh)) .. " < " .. tostring(thr) .. ")")
+      local fg = self:buyerGems(fresh)
+      local required = math.max(negotiation.threshold(d.cfg, quote, round), hardFloor)
+      if fg < required then
+        return self:abort(("safety: buyer %s < required %s (hardFloor %s)"):format(tostring(fg), tostring(required), tostring(hardFloor)))
+      end
+      if d.cfg.testMode then
+        d.log(("TEST MODE: WOULD SELL %s for %s gems - not confirming"):format(setName, tostring(fg)))
+        task.wait(1)
+        return self:abort("test mode (no confirm)")
       end
       d.remotes.trading_confirmtrade:FireServer()
-      local cost = (feedEntry and feedEntry.value or 0) * qty
-      if d.onSold then d.onSold(setName, qty, buyerGems(fresh), cost) end
+      local cost = (marketVal or 0)
+      if d.onSold then d.onSold(setName, 1, fg, cost) end
       return
     elseif decision.action == "COUNTER" then
       if d.sendTradeMsg then d.sendTradeMsg(decision.message) end
       task.wait(d.cfg.negotiation.chatCooldownSec or 4)
     elseif decision.action == "ABORT" then
-      return self:abort("negotiation failed")
+      return self:abort("buyer offer too low")
     else
       task.wait(2)
     end
@@ -1085,27 +1152,30 @@ function M:runBuy(invite)
   self:accept(invite)
   local at = self:waitForTrade(d.cfg.tradeTimeoutSec)
   if not at then return self:abort("buy: no active trade") end
+
   local setName = d.pickBuyItem and d.pickBuyItem(at)
   if not setName then return self:abort("buy: item not on buy list") end
   local feedEntry = d.feed[setName]
   local wantEntry = (d.cfg.buy or {})[setName] or {}
-  local qty = 1
-  local bq = pricing.buyQuote(d.cfg, feedEntry or {}, wantEntry, qty)
+  local bq = pricing.buyQuote(d.cfg, feedEntry or {}, wantEntry, 1)
   if not bq then return self:abort("no buy price: " .. setName) end
 
   local start = os.time()
   for round = 0, (d.cfg.negotiation.maxRounds or 3) do
     local cur = d.getActiveTrade() or at
-    local decision = negotiation.decideBuy(d.cfg, bq, {
-      sellerAsk = buyerGems(cur), round = round, elapsed = os.time() - start,
-    })
+    local ask = self:buyerGems(cur)
+    local decision = negotiation.decideBuy(d.cfg, bq, { sellerAsk = ask, round = round, elapsed = os.time() - start })
     if decision.action == "ACCEPT" then
       local fresh = d.getActiveTrade() or cur
-      if not scamguard.safeToConfirmBuy(bq.max, buyerGems(fresh)) then
+      if not scamguard.safeToConfirmBuy(bq.max, self:buyerGems(fresh)) then
         return self:abort("scam-guard: seller raised price")
       end
+      if d.cfg.testMode then
+        d.log(("TEST MODE: WOULD BUY %s for %s - not confirming"):format(setName, tostring(self:buyerGems(fresh))))
+        return self:abort("test mode (no confirm)")
+      end
       d.remotes.trading_confirmtrade:FireServer()
-      if d.onBought then d.onBought(setName, qty, buyerGems(fresh)) end
+      if d.onBought then d.onBought(setName, 1, self:buyerGems(fresh)) end
       return
     elseif decision.action == "COUNTER" then
       if d.sendTradeMsg then d.sendTradeMsg(decision.message) end
@@ -1121,13 +1191,12 @@ function M:runBuy(invite)
 end
 
 -- ---- shared -----------------------------------------------------------------
--- Base shape: additem:FireServer({ { itemID = tostring(id), className = class } })
 function M:addItem(setName, qty)
   local id = self.d.catalog[setName]
-  if not id then self.d.log("no itemID for " .. tostring(setName) .. " - cannot add"); return end
+  if not id then self.d.log("no itemID for '" .. tostring(setName) .. "' - cannot add"); return end
   local descriptor = { { itemID = tostring(id), className = setName } }
   self.d.remotes.trading_additem:FireServer(descriptor)
-  self.d.log(("added %s (id %s) x%d"):format(setName, tostring(id), qty or 1))
+  self.d.log(("added %s (id %s)"):format(setName, tostring(id)))
 end
 
 function M:abort(reason)
@@ -1260,6 +1329,26 @@ function M.build(deps)
   -- ---- Main tab ----
   Main:Toggle({ Title = "Enable Universal Auto-Trade", Value = cfg.enabled,
     Callback = function(v) cfg.enabled = v; save(cfg); if deps.onToggleEnabled then deps.onToggleEnabled(v) end end })
+  Main:Toggle({ Title = "Test Mode (accepts + adds item, never confirms)", Value = cfg.testMode ~= false,
+    Callback = function(v) cfg.testMode = v; save(cfg) end })
+
+  -- Active vend item: the single item the bot sells in every trade.
+  local vendNames = { "(highest-value For Sale)" }
+  do
+    local ns = {}
+    for name in pairs(deps.feed) do ns[#ns + 1] = name end
+    table.sort(ns)
+    for _, n in ipairs(ns) do vendNames[#vendNames + 1] = n end
+  end
+  Main:Dropdown({ Title = "Active Vend Item (what it sells)", Values = vendNames,
+    Value = (cfg.activeVendItem ~= "" and cfg.activeVendItem) or vendNames[1],
+    Callback = function(sel)
+      if sel == vendNames[1] then cfg.activeVendItem = "" else
+        cfg.activeVendItem = sel
+        cfg.items[sel] = cfg.items[sel] or {}; cfg.items[sel].forSale = true
+      end
+      save(cfg)
+    end })
   Main:Slider({ Title = "Global Markup %", Step = 1,
     Value = { Min = 0, Max = 50, Default = cfg.globalMarkupPct },
     Callback = function(v) cfg.globalMarkupPct = v; save(cfg) end })
@@ -1442,9 +1531,9 @@ if remotes and rroot then
     if m == "buy" and lastMode ~= "buy" then onEvent("cap", { gems = gems }) end
     lastMode = m; return m
   end
-  -- The buyer sends gems, not a "wanted item" field, so we sell the highest-value
-  -- item currently marked For Sale.
+  -- Sell the configured Active Vend Item; else the highest-value For Sale item.
   local function pickSellItem(_at)
+    if cfg.activeVendItem and cfg.activeVendItem ~= "" then return cfg.activeVendItem end
     local best, bestVal
     for name, ov in pairs(cfg.items or {}) do
       if ov.forSale then
