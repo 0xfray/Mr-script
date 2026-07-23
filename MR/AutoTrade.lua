@@ -1,4 +1,4 @@
--- Universal Auto-Trade v1.14-confirm  |  bundled by tools/bundle.py - do not edit.
+-- Universal Auto-Trade v1.15-messages  |  bundled by tools/bundle.py - do not edit.
 -- Source of truth: src/*.lua  (regenerate: python tools/bundle.py)
 local __M = {}
 __M["lib.parse"] = (function()
@@ -169,6 +169,13 @@ function M.defaults()
     tradeTimeoutSec = 60,
     negotiation = { maxRounds = 4, concedeStepPct = 3, chatCooldownSec = 4 },
     ads = { rotatingAds = false, autoInvite = false, stockOnly = true, intervalSec = 45 },
+
+    -- Editable chat messages. Tokens: ad uses {items}; trade uses {item},
+    -- {price} (short e.g. 750k) and {priceRaw} (the number).
+    messages = {
+      ad    = "Selling: {items} — msg me",
+      trade = "Selling {item} for {price} gems — add gems and confirm!",
+    },
     items = {},               -- [name] = { value?, markupPct?, bandPct?, forSale? }
 
     -- Auto-buyer at gem cap (OFF by default; sell mode is the primary use)
@@ -412,9 +419,20 @@ function M.short(n)
   return tostring(n)
 end
 
--- Build a single advertisement line from listings { {name, ask}, ... }.
--- Returns nil when there is nothing to advertise.
-function M.line(listings, opts)
+-- Render a template, replacing {key} tokens from `vars`. Unknown tokens are
+-- left as-is. Returns nil for an empty/blank template.
+function M.render(template, vars)
+  if type(template) ~= "string" or template:match("^%s*$") then return nil end
+  return (template:gsub("{(%w+)}", function(k)
+    local v = vars and vars[k]
+    if v == nil then return "{" .. k .. "}" end
+    return tostring(v)
+  end))
+end
+
+-- Just the item list part: "Wave Chair 750k, Ocean Set 1m +2 more" (no prefix/
+-- suffix). Returns nil when there is nothing to advertise.
+function M.itemsText(listings, opts)
   opts = opts or {}
   local maxItems = opts.maxItems or 5
   if #listings == 0 then return nil end
@@ -423,10 +441,18 @@ function M.line(listings, opts)
   for i = 1, shown do
     parts[#parts + 1] = ("%s %s"):format(listings[i].name, M.short(listings[i].ask))
   end
-  local msg = "Selling: " .. table.concat(parts, ", ")
+  local msg = table.concat(parts, ", ")
   local omitted = #listings - shown
   if omitted > 0 then msg = msg .. (" +%d more"):format(omitted) end
-  return msg .. " — msg me"
+  return msg
+end
+
+-- Default full advertisement line (kept for callers/tests). New code renders a
+-- user-editable template around itemsText instead (see cfg.messages.ad).
+function M.line(listings, opts)
+  local items = M.itemsText(listings, opts)
+  if not items then return nil end
+  return "Selling: " .. items .. " — msg me"
 end
 
 return M
@@ -1407,6 +1433,7 @@ __M["runtime.trade"] = (function()
 local pricing = __M["lib.pricing"]
 local negotiation = __M["lib.negotiation"]
 local scamguard = __M["lib.scamguard"]
+local ads = __M["lib.ads"]
 local gamedata = __M["runtime.gamedata"]
 
 local M = {}
@@ -1665,7 +1692,9 @@ function M:runSell(invite)
     return self:abort("could not add " .. setName)
   end
   if d.sendTradeMsg then
-    d.sendTradeMsg(("Selling %s for %s gems - add gems and confirm!"):format(setName, tostring(quote.ask)))
+    local template = (d.cfg.messages and d.cfg.messages.trade) or "Selling {item} for {price} gems — add gems and confirm!"
+    local msg = ads.render(template, { item = setName, price = ads.short(quote.ask), priceRaw = quote.ask })
+    if msg then d.sendTradeMsg(msg) end
   end
   d.log(("SELL %s | ask %s ceiling %s floor %s hardFloor %s | buyer has %s")
     :format(setName, tostring(quote.ask), tostring(quote.ceiling), tostring(quote.floor), tostring(hardFloor), tostring(self:buyerGems(at))))
@@ -1874,7 +1903,9 @@ function M.start(deps)
           end
         end
         local listings = buildListings(cfg, deps.feed, owned)
-        local line = ads.line(listings, { maxItems = 5 })
+        local items = ads.itemsText(listings, { maxItems = 5 })
+        local template = (cfg.messages and cfg.messages.ad) or "Selling: {items} — msg me"
+        local line = items and ads.render(template, { items = items }) or nil
         if line then
           local ok, err, path = sendChat(line)
           if ok and not loggedChatPath then loggedChatPath = true; deps.log("chat path = " .. tostring(path)) end
@@ -1978,8 +2009,22 @@ function M.build(deps)
 
   local Main = Window:Tab({ Title = "Auto-Trade", Icon = "coins" })
   local Items = Window:Tab({ Title = "Items", Icon = "list" })
+  local Messages = Window:Tab({ Title = "Messages", Icon = "message-square" })
   local Safety = Window:Tab({ Title = "24/7 & Safety", Icon = "shield" })
   local Diag = Window:Tab({ Title = "Diagnostics", Icon = "bug" })
+
+  -- ---- Messages tab: editable chat + in-trade text ----
+  cfg.messages = cfg.messages or {}
+  Messages:Paragraph({ Title = "Chat advertisement",
+    Desc = "Public chat ad. Token: {items} = your for-sale list (e.g. \"Wave Chair 750k\")." })
+  Messages:Input({ Title = "Ad message", Value = cfg.messages.ad or "",
+    Placeholder = "Selling: {items} — msg me",
+    Callback = function(txt) if txt and txt ~= "" then cfg.messages.ad = txt; save(cfg) end end })
+  Messages:Paragraph({ Title = "In-trade message",
+    Desc = "Sent to the buyer when the item is added. Tokens: {item}, {price} (e.g. 750k), {priceRaw} (number)." })
+  Messages:Input({ Title = "Trade message", Value = cfg.messages.trade or "",
+    Placeholder = "Selling {item} for {price} gems — add gems and confirm!",
+    Callback = function(txt) if txt and txt ~= "" then cfg.messages.trade = txt; save(cfg) end end })
 
   local statusParagraph = Main:Paragraph({
     Title = "Status", Desc = "Idle - not enabled.",
@@ -2123,7 +2168,7 @@ end)()
 -- (workspace.__THINGS.__REMOTES + Framework.Library) and builds its own WindUI.
 local CONFIG = {
   feedUrl = "https://raw.githubusercontent.com/0xfray/Mr-script/refs/heads/main/MR/value.lua",
-  version = "v1.14-confirm",
+  version = "v1.15-messages",
 }
 
 local libConfig  = __M["lib.config"]
