@@ -1,4 +1,4 @@
--- Universal Auto-Trade v1.9-orders  |  bundled by tools/bundle.py - do not edit.
+-- Universal Auto-Trade v1.10-busyfix  |  bundled by tools/bundle.py - do not edit.
 -- Source of truth: src/*.lua  (regenerate: python tools/bundle.py)
 local __M = {}
 __M["lib.parse"] = (function()
@@ -904,7 +904,8 @@ function M.catalog(root)
             local id = entry.ID or entry.id or entry.itemID
             local name = entry.name or entry.Name
             if id and name and not cat[name] then
-              cat[name] = { id = tostring(id), className = entry.className or entry.class }
+              cat[name] = { id = tostring(id), className = entry.className or entry.class,
+                            subClass = entry.subClass or entry.subclass }
             end
           end
         end
@@ -1020,11 +1021,17 @@ end
 -- confirmed from a live dump.) A strong signal that a trade window is open
 -- even if we haven't located the trade object's field yet.
 function M.myBusy(s)
-  local bp = type(s) == "table" and s.busyPlayers or nil
-  if type(bp) ~= "table" then return false end
   local me = Players.LocalPlayer and Players.LocalPlayer.UserId
-  if not me then return false end
-  return (bp[me] or bp[tostring(me)]) and true or false
+  return M.isBusy(s, me)
+end
+
+-- Is player `uid` currently in a trade? Live dumps proved you CANNOT accept an
+-- invite from a busy player (they're mid-trade with someone else) - the accept
+-- silently opens no window. So we skip busy inviters.
+function M.isBusy(s, uid)
+  local bp = type(s) == "table" and s.busyPlayers or nil
+  if type(bp) ~= "table" or uid == nil then return false end
+  return (bp[uid] or bp[tostring(uid)] or bp[tonumber(uid)]) and true or false
 end
 
 return M
@@ -1035,51 +1042,56 @@ local M = {}
 
 -- Returns { [name] = qty } for items the player owns, or nil when the
 -- inventory can't be read (unknown - callers must not treat that as "owns
--- nothing"). Reads Library.Inventory.<Class> tables straight off the required
--- Framework Library root (same root gamedata uses; confirmed in the deob:
--- plaza iterates Library.Inventory.Furniture / .Appliance). Entries are mapped
--- id -> name through the Directory catalog built by gamedata.catalog.
-local cachedCatalog, cachedById
+-- nothing"). Uses the live Framework Library's Inventory.GetItemCount function
+-- (confirmed 2026-07-23: Inventory is a module of functions, and
+-- GetOwnedByClassAndSubclass(class, subclass) returns a count). GetItemCount's
+-- exact signature isn't documented, so we self-calibrate: try a few call
+-- shapes over the catalog and keep the one that returns numbers for our items
+-- and a positive count for at least one (the player does own things).
 function M.owned(root, catalog)
   if type(root) ~= "table" or type(catalog) ~= "table" then return nil end
-  -- the catalog is immutable after startup; build the reverse index once
-  if catalog ~= cachedCatalog then
-    cachedById = {}
-    for name, c in pairs(catalog) do
-      if c and c.id then cachedById[tostring(c.id)] = name end
-    end
-    cachedCatalog = catalog
-  end
-  local byId = cachedById
-  local out
-  local ok = pcall(function()
-    local inv = root.Inventory
-    if type(inv) ~= "table" then return end
-    -- Live shape (confirmed 2026-07-23): Library.Inventory is a MODULE of
-    -- functions (GetSlot, GetOwnedByClassAndSubclass, ...), not item tables.
-    -- Only report a real result when we actually find category tables;
-    -- functions-only means we can't read stock -> nil (unknown).
-    local sawCategory = false
-    local counts = {}
-    for _, classTbl in pairs(inv) do
-      if type(classTbl) == "table" then
-        sawCategory = true
-        for _, entry in pairs(classTbl) do
-          if type(entry) == "table" then
-            local id = entry.id or entry.ID or entry.itemID
-            local name = id and byId[tostring(id)]
-            if name then
-              local qty = tonumber(entry.amount or entry.count or entry.qty) or 1
-              counts[name] = (counts[name] or 0) + qty
-            end
-          end
-        end
+  local inv = root.Inventory
+  if type(inv) ~= "table" then return nil end
+  local getCount = inv.GetItemCount
+  if type(getCount) ~= "function" then return nil end
+
+  -- candidate GetItemCount signatures (dot-call; c = catalog entry)
+  local sigs = {
+    function(c) return getCount(c.id) end,
+    function(c) return getCount(tonumber(c.id)) end,
+    function(c) return getCount(c.className, c.subClass, c.id) end,
+    function(c) return getCount(c.className, c.id) end,
+  }
+
+  local names = {}
+  for name in pairs(catalog) do names[#names + 1] = name end
+  if #names == 0 then return nil end
+
+  local function score(sig)
+    local numeric, positives = 0, 0
+    for _, name in ipairs(names) do
+      local ok, v = pcall(sig, catalog[name])
+      if ok and type(v) == "number" then
+        numeric = numeric + 1
+        if v > 0 then positives = positives + 1 end
       end
     end
-    if sawCategory then out = counts end
-  end)
-  if not ok then return nil end
-  return out
+    return numeric, positives
+  end
+
+  local best
+  for _, sig in ipairs(sigs) do
+    local numeric, positives = score(sig)
+    if numeric >= math.floor(#names * 0.8) and positives > 0 then best = sig; break end
+  end
+  if not best then return nil end
+
+  local owned = {}
+  for _, name in ipairs(names) do
+    local ok, v = pcall(best, catalog[name])
+    if ok and type(v) == "number" and v > 0 then owned[name] = v end
+  end
+  return owned
 end
 
 return M
@@ -1195,22 +1207,29 @@ function M.run(log, t)
     if not ok or type(root) ~= "table" then return end
     local inv = root.Inventory
     if type(inv) ~= "table" then log:info("Inventory is " .. type(inv), t); return end
-    local f = inv.GetOwnedByClassAndSubclass
-    if type(f) ~= "function" then log:info("no GetOwnedByClassAndSubclass function", t); return end
-    local trials = {
-      { label = 'f("Furniture","Chair")', args = { "Furniture", "Chair" } },
-      { label = 'f(Inventory,"Furniture","Chair")', args = { inv, "Furniture", "Chair" } },
-    }
-    for _, tr in ipairs(trials) do
-      local okc, res = pcall(f, table.unpack(tr.args))
+    local function tryCall(fname, label, args)
+      local f = inv[fname]
+      if type(f) ~= "function" then log:info("no " .. fname .. " function", t); return end
+      local okc, res = pcall(f, table.unpack(args, 1, args.n or #args))
       if not okc then
-        log:info("GetOwnedByClassAndSubclass " .. tr.label .. " errored: " .. tostring(res), t)
+        log:info(fname .. " " .. label .. " errored: " .. tostring(res), t)
       elseif type(res) == "table" then
-        logDump(log, "GetOwnedByClassAndSubclass " .. tr.label, res, t, { maxDepth = 2, maxKeys = 10 })
+        logDump(log, fname .. " " .. label, res, t, { maxDepth = 2, maxKeys = 12 })
       else
-        log:info("GetOwnedByClassAndSubclass " .. tr.label .. " -> " .. tostring(res) .. " (" .. type(res) .. ")", t)
+        log:info(fname .. " " .. label .. " -> " .. tostring(res) .. " (" .. type(res) .. ")", t)
       end
     end
+    -- GetOwnedByClassAndSubclass confirmed: dot-call (class, subclass) -> count.
+    tryCall("GetOwnedByClassAndSubclass", 'f("Furniture","Chair")', { "Furniture", "Chair" })
+    -- Map GetItemCount + Get so per-item ownership can be read. "13" = Wooden
+    -- Counter (a Furniture/Table item), a good known id to probe.
+    tryCall("GetItemCount", 'f("13")', { "13" })
+    tryCall("GetItemCount", 'f(13)', { 13 })
+    tryCall("GetItemCount", 'f("Furniture","Table","13")', { "Furniture", "Table", "13" })
+    tryCall("GetItemCount", 'f("Furniture","13")', { "Furniture", "13" })
+    tryCall("Get", 'f()', { n = 0 })
+    tryCall("Get", 'f("13")', { "13" })
+    tryCall("Get", 'f("Furniture")', { "Furniture" })
   end)
 
   -- TRADING STATUS: exercise the exact same path the trade loop uses
@@ -1663,31 +1682,33 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ads = __M["lib.ads"]
 local M = {}
 
--- Post to public chat. Feature-detects the chat system: modern TextChatService
--- games take RBXGeneral:SendAsync; legacy-chat games need the
--- SayMessageRequest remote. Returns (ok, err, path) so callers can log which
--- path actually worked.
+-- cloneref hides our reference to the service from the game's anti-cheat hooks
+-- (executor builtin; harmless passthrough where it isn't available).
+local function cref(o) return (cloneref and cloneref(o)) or o end
+
+-- Legacy remote path (also the fallback if SendAsync is blocked for this executor).
+local function sayLegacy(text)
+  return pcall(function()
+    cref(ReplicatedStorage).DefaultChatSystemChatEvents.SayMessageRequest:FireServer(text, "All")
+  end)
+end
+
+-- Post to public chat. Detects legacy vs TextChatService the same way the
+-- known-working community pattern does. Returns (ok, err, path) so callers can
+-- log which path worked.
 local function sendChat(text)
-  local useModern = true
-  pcall(function() useModern = TextChatService.ChatVersion == Enum.ChatVersion.TextChatService end)
-  if useModern then
-    local ok, err = pcall(function()
-      local ch = TextChatService:WaitForChild("TextChannels", 5):WaitForChild("RBXGeneral", 5)
-      ch:SendAsync(text)
-    end)
+  text = tostring(text)
+  local tcs = cref(TextChatService)
+  local legacy = false
+  pcall(function() legacy = tcs.ChatVersion == Enum.ChatVersion.LegacyChatService end)
+  if not legacy then
+    local ok, err = pcall(function() tcs.TextChannels.RBXGeneral:SendAsync(text) end)
     if ok then return true, nil, "SendAsync" end
-    -- fall through to legacy in case the modern path is blocked for this executor
-    local ok2, err2 = pcall(function()
-      ReplicatedStorage:WaitForChild("DefaultChatSystemChatEvents", 3)
-        :WaitForChild("SayMessageRequest", 3):FireServer(text, "All")
-    end)
+    local ok2, err2 = sayLegacy(text)
     if ok2 then return true, nil, "SayMessageRequest(fallback)" end
     return false, tostring(err) .. " / " .. tostring(err2), nil
   end
-  local ok, err = pcall(function()
-    ReplicatedStorage:WaitForChild("DefaultChatSystemChatEvents", 5)
-      :WaitForChild("SayMessageRequest", 5):FireServer(text, "All")
-  end)
+  local ok, err = sayLegacy(text)
   return ok, err, ok and "SayMessageRequest" or nil
 end
 M.sendChat = sendChat
@@ -1769,7 +1790,9 @@ function M.start(deps)
           local sent = 0
           for _, plr in ipairs(Players:GetPlayers()) do
             if sent >= 5 then break end
-            if plr ~= Players.LocalPlayer and not isBlocklisted(plr) then
+            -- don't invite players already mid-trade (they can't accept us)
+            local busy = deps.isBusyPlayer and deps.isBusyPlayer(plr.UserId)
+            if plr ~= Players.LocalPlayer and not isBlocklisted(plr) and not busy then
               local last = lastInvited[plr.UserId]
               if not last or (now - last) >= window then
                 deps.remotes.trading_sendinvite:FireServer(plr)
@@ -1965,7 +1988,7 @@ end)()
 -- (workspace.__THINGS.__REMOTES + Framework.Library) and builds its own WindUI.
 local CONFIG = {
   feedUrl = "https://raw.githubusercontent.com/0xfray/Mr-script/refs/heads/main/MR/value.lua",
-  version = "v1.9-orders",
+  version = "v1.10-busyfix",
 }
 
 local libConfig  = __M["lib.config"]
@@ -2241,6 +2264,7 @@ if remotes and rroot then
     task.spawn(function() runner:handle({ active = true, uid = uid, player = player, name = player and player.Name or nil }) end)
   end
 
+  local busySkipLogged = {}
   local function processStatus(s)
     if type(s) ~= "table" then return end
     latestStatus = s
@@ -2259,17 +2283,25 @@ if remotes and rroot then
         if not dumpedInvite then dumpedInvite = true; logDump("incomingInvites entry", (type(entry) == "table" and entry) or { value = entry }) end
         local uid = (type(entry) == "table" and (entry.uid or entry.id)) or key
         uid = tonumber(uid) or uid  -- one cooldown entry per player, string or number key
-        -- NOTE: no busyPlayers gating here - its semantics are unconfirmed
-        -- (nothing in the wild reads it) and gating on it skipped nearly all
-        -- invites. The 15s accept window bounds the cost of a stale invite.
-        local player = gamedata.playerFromUid(uid)
-        if not player then
-          -- only a real Player instance is usable (as accept arg / blocklist
-          -- name); a raw table would FireServer garbage - fall back to the uid
-          local e = type(entry) == "table" and (entry.inviter or entry.player) or nil
-          if type(e) == "userdata" then player = e end
+        -- Skip inviters the server marks busy: a live dump proved accepting a
+        -- busy player's invite opens NO trade window (they're mid-trade with
+        -- someone else) - it just hangs, then aborts. Wait for a free inviter.
+        if gamedata.isBusy(s, uid) then
+          if not busySkipLogged[uid] then
+            busySkipLogged[uid] = true
+            logp("skipping invite from busy (mid-trade) player uid=" .. tostring(uid))
+          end
+        else
+          busySkipLogged[uid] = nil
+          local player = gamedata.playerFromUid(uid)
+          if not player then
+            -- only a real Player instance is usable (as accept arg / blocklist
+            -- name); a raw table would FireServer garbage - fall back to entry.inviter
+            local e = type(entry) == "table" and (entry.inviter or entry.player) or nil
+            if type(e) == "userdata" then player = e end
+          end
+          tryHandleInvite(uid, player)
         end
-        tryHandleInvite(uid, player)
       end
     end
   end
@@ -2298,7 +2330,8 @@ if remotes and rroot then
     ownedFn = function() return inventory.owned(rroot, catalog) end,
     remotes = remotes,
     isBusy = function() return runner.busy end,
-    hasActiveTrade = function() return getActiveTrade() ~= nil end })
+    hasActiveTrade = function() return getActiveTrade() ~= nil end,
+    isBusyPlayer = function(userId) return gamedata.isBusy(latestStatus, userId) end })
   setStatus("Ready. Trading " .. (cfg.enabled and "ENABLED" or "disabled") .. (cfg.testMode and " (TEST)" or "") .. ".")
   logok("trading wired")
 elseif not wrongPlace then
