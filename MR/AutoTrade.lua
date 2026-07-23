@@ -99,6 +99,7 @@ function M.defaults()
     requireBuyerConfirm = true,  -- only confirm once the buyer has confirmed
     confirmVerifyTimeoutSec = 10, -- wait this long for the trade to clear after confirm
     inviteCooldownSec = 120,     -- min seconds between auto-invites to the same player
+    acceptTimeoutSec = 15,       -- give up on an accepted invite if no trade window opens
 
     -- Housekeeping
     feedRefreshSec = 1800,    -- re-fetch the value feed every 30 min (0 = never)
@@ -872,6 +873,66 @@ function M.playerFromUid(uid)
   return ok and p or nil
 end
 
+-- Find the live trade object in a status table. A real Trading_GetStatus dump
+-- (2026-07-23) showed top-level keys busyPlayers/history/incomingInvites/
+-- outgoingInvites/tradeSettings and NO activeTrade while idle - so the trade
+-- object's key is unconfirmed and we search: known names first, then any
+-- trade-ish top-level key holding (or mapping our uid to) a table with
+-- offered/confirm/tradeUID-style fields. Returns (trade, keyPath).
+local KNOWN_TRADE_KEYS = { "activeTrade", "trade", "currentTrade", "activeTrades" }
+local function tradeLike(t)
+  if type(t) ~= "table" then return false end
+  for k in pairs(t) do
+    if type(k) == "string" then
+      local lk = k:lower()
+      if lk:find("offered") or lk:find("tradeuid") or lk:find("confirmed") then return true end
+    end
+  end
+  return false
+end
+
+function M.findActiveTrade(s)
+  if type(s) ~= "table" then return nil end
+  local me = Players.LocalPlayer and Players.LocalPlayer.UserId
+  -- deob-confirmed exact name: any non-empty table counts (a just-opened trade
+  -- may not have offered/confirm fields yet)
+  if type(s.activeTrade) == "table" and next(s.activeTrade) ~= nil then return s.activeTrade, "activeTrade" end
+  for _, k in ipairs(KNOWN_TRADE_KEYS) do
+    local v = s[k]
+    if type(v) == "table" then
+      if tradeLike(v) then return v, k end
+      if me then
+        local mine = v[me] or v[tostring(me)]
+        if tradeLike(mine) then return mine, k .. "[me]" end
+      end
+    end
+  end
+  for k, v in pairs(s) do
+    if type(k) == "string" and type(v) == "table" then
+      local lk = k:lower()
+      if lk:find("trade") and not lk:find("history") and not lk:find("settings") and not lk:find("invite") then
+        if tradeLike(v) then return v, k end
+        if me then
+          local mine = v[me] or v[tostring(me)]
+          if tradeLike(mine) then return mine, k .. "[me]" end
+        end
+      end
+    end
+  end
+  return nil
+end
+
+-- Does the server currently mark US as in a trade? (busyPlayers is uid-keyed,
+-- confirmed from a live dump.) A strong signal that a trade window is open
+-- even if we haven't located the trade object's field yet.
+function M.myBusy(s)
+  local bp = type(s) == "table" and s.busyPlayers or nil
+  if type(bp) ~= "table" then return false end
+  local me = Players.LocalPlayer and Players.LocalPlayer.UserId
+  if not me then return false end
+  return (bp[me] or bp[tostring(me)]) and true or false
+end
+
 return M
 
 end)()
@@ -900,21 +961,28 @@ function M.owned(root, catalog)
   local ok = pcall(function()
     local inv = root.Inventory
     if type(inv) ~= "table" then return end
-    out = {}
+    -- Live shape (confirmed 2026-07-23): Library.Inventory is a MODULE of
+    -- functions (GetSlot, GetOwnedByClassAndSubclass, ...), not item tables.
+    -- Only report a real result when we actually find category tables;
+    -- functions-only means we can't read stock -> nil (unknown).
+    local sawCategory = false
+    local counts = {}
     for _, classTbl in pairs(inv) do
       if type(classTbl) == "table" then
+        sawCategory = true
         for _, entry in pairs(classTbl) do
           if type(entry) == "table" then
             local id = entry.id or entry.ID or entry.itemID
             local name = id and byId[tostring(id)]
             if name then
               local qty = tonumber(entry.amount or entry.count or entry.qty) or 1
-              out[name] = (out[name] or 0) + qty
+              counts[name] = (counts[name] or 0) + qty
             end
           end
         end
       end
     end
+    if sawCategory then out = counts end
   end)
   if not ok then return nil end
   return out
@@ -1005,13 +1073,16 @@ function M.run(log, t)
     logDump(log, "Library root keys", root, t, { maxDepth = 1, maxKeys = 70 })
 
     -- Item categories: dump a few sample entries so we can find the id field.
+    -- Inventory gets all its keys dumped - the live shape is a module of
+    -- functions (GetSlot, GetOwnedByClassAndSubclass, ...) we still need to map.
     for _, catego in ipairs({ "Furniture", "Appliance", "Directory", "Inventory", "Food" }) do
       local tbl = root[catego]
       if type(tbl) == "table" then
         local n = 0
+        local sampleMax = (catego == "Inventory") and 12 or 3
         for k, v in pairs(tbl) do
           n = n + 1
-          if n <= 3 then logDump(log, catego .. "[" .. tostring(k) .. "]", (type(v) == "table" and v) or { value = v }, t, { maxDepth = 2 }) end
+          if n <= sampleMax then logDump(log, catego .. "[" .. tostring(k) .. "]", (type(v) == "table" and v) or { value = v }, t, { maxDepth = 2 }) end
         end
         log:ok(catego .. " count = " .. n, t)
       end
@@ -1147,6 +1218,7 @@ local pricing = __M["lib.pricing"]
 local negotiation = __M["lib.negotiation"]
 local scamguard = __M["lib.scamguard"]
 local tf = __M["lib.tradefields"]
+local gamedata = __M["runtime.gamedata"]
 
 local M = {}
 
@@ -1177,13 +1249,14 @@ function M:targetConfirmed(at)
   return v
 end
 
--- Live activeTrade via a fresh status poll; falls back to the cached status
--- when the poll itself fails.
+-- Live trade object via a fresh status poll (searched, not just .activeTrade -
+-- the live status shape differs from the deob); falls back to the cached
+-- status when the poll itself fails.
 function M:freshTrade()
   local d = self.d
   if d.refreshStatus then
     local s = d.refreshStatus()
-    if type(s) == "table" then return s.activeTrade end
+    if type(s) == "table" then return (gamedata.findActiveTrade(s)) end
   end
   return d.getActiveTrade()
 end
@@ -1265,22 +1338,46 @@ function M:accept(invite)
 end
 
 function M:waitForTrade(timeout)
+  local d = self.d
   local start = os.time()
+  local warnedBusy = false
   repeat
     local at = self:freshTrade()
     if type(at) == "table" then return at end
+    -- Key diagnostic: the server says we're in a trade but we can't find the
+    -- trade object - the field name differs from every guess. Dump everything.
+    if not warnedBusy and d.myBusy and d.myBusy() then
+      warnedBusy = true
+      d.log("server marks us BUSY (trade open) but no trade object found in status - dumping full status")
+      if d.dumpFullStatus then d.dumpFullStatus("full status while busy") end
+    end
     task.wait(0.4)
-  until os.time() - start > (timeout or 60)
+  until os.time() - start > (timeout or 15)
   return self:freshTrade()
+end
+
+-- Accept + wait for the window. The deob showed BOTH accept forms (Player
+-- object and uid); we try the Player first and retry once with the uid if no
+-- window opens - the debug report then tells us which form the server honors.
+function M:acceptAndWait(invite)
+  local d = self.d
+  local window = d.cfg.acceptTimeoutSec or 15
+  if invite.active then return self:waitForTrade(window) end
+  self:accept(invite)
+  local at = self:waitForTrade(window)
+  if not at and invite.uid and invite.player then
+    d.log("no trade window after Player-object accept - retrying with uid " .. tostring(invite.uid))
+    pcall(function() d.remotes.trading_acceptinvite:FireServer(tonumber(invite.uid) or invite.uid) end)
+    at = self:waitForTrade(window)
+  end
+  if not at and d.dumpFullStatus then d.dumpFullStatus("full status after accept never showed a trade") end
+  return at
 end
 
 -- ---- SELL -------------------------------------------------------------------
 function M:runSell(invite)
   local d = self.d
-  -- invite.active = trade already open (e.g. from our own outgoing invite);
-  -- accepting again would be wrong.
-  if not invite.active then self:accept(invite) end
-  local at = self:waitForTrade(d.cfg.tradeTimeoutSec)
+  local at = self:acceptAndWait(invite)
   if not at then return self:abort("no active trade after accept") end
 
   local setName = d.pickSellItem and d.pickSellItem(at)
@@ -1355,8 +1452,7 @@ end
 -- ---- BUY (gem-cap mode) -----------------------------------------------------
 function M:runBuy(invite)
   local d = self.d
-  if not invite.active then self:accept(invite) end
-  local at = self:waitForTrade(d.cfg.tradeTimeoutSec)
+  local at = self:acceptAndWait(invite)
   if not at then return self:abort("buy: no active trade") end
 
   local setName = d.pickBuyItem and d.pickBuyItem(at)
@@ -1560,6 +1656,11 @@ function M.build(deps)
   end)
   if not ok or not WindUI then return nil end
 
+  -- Reopen key for the hide/show fallback below. We bind this ourselves and do
+  -- NOT also pass WindUI's ToggleKey option - both handling the same key would
+  -- double-toggle and cancel out.
+  local TOGGLE_KEY = Enum.KeyCode.RightControl
+
   local Window = WindUI:CreateWindow({
     Title = "Universal Auto-Trade",
     Icon = "arrows-exchange",
@@ -1568,6 +1669,14 @@ function M.build(deps)
     Size = UDim2.fromOffset(580, 520),
     Transparent = true,
     Theme = "Dark",
+    -- Floating button shown while the window is closed/minimized (newer WindUI
+    -- releases; older ones just ignore unknown options).
+    OpenButton = {
+      Title = "Open Auto-Trade",
+      Enabled = true,
+      Draggable = true,
+      OnlyMobile = false,
+    },
   })
 
   local Main = Window:Tab({ Title = "Auto-Trade", Icon = "coins" })
@@ -1580,6 +1689,8 @@ function M.build(deps)
   })
 
   -- ---- Diagnostics tab ----
+  Diag:Paragraph({ Title = "Controls",
+    Desc = "Right Ctrl hides/shows this window. When it's minimized, a floating 'Open Auto-Trade' button also brings it back." })
   Diag:Paragraph({ Title = "Debug report",
     Desc = "Press Copy, then paste it back to get help. It lists remotes, gem sources, and boot steps." })
   Diag:Button({ Title = "Copy Debug Report", Icon = "clipboard-copy",
@@ -1675,6 +1786,21 @@ function M.build(deps)
   Safety:Input({ Title = "Discord Webhook URL (blank = off)",
     Callback = function(txt) cfg.webhook.url = txt or ""; save(cfg) end })
 
+  -- Keyboard fallback to get the window back when it's closed/minimized, in
+  -- case the WindUI release in use lacks the floating OpenButton. Prefers
+  -- Window:Toggle() (hide AND show); falls back to Window:Open() (show only).
+  pcall(function()
+    local UIS = game:GetService("UserInputService")
+    UIS.InputBegan:Connect(function(input, gameProcessed)
+      if gameProcessed then return end
+      if input.KeyCode ~= TOGGLE_KEY then return end
+      pcall(function()
+        if type(Window.Toggle) == "function" then Window:Toggle()
+        elseif type(Window.Open) == "function" then Window:Open() end
+      end)
+    end)
+  end)
+
   local handle = { window = Window, status = statusParagraph }
   function handle.setStatus(text)
     pcall(function() statusParagraph:SetDesc(text) end)
@@ -1682,6 +1808,7 @@ function M.build(deps)
   function handle.notify(text)
     pcall(function() WindUI:Notify({ Title = "Auto-Trade", Content = text, Duration = 8 }) end)
   end
+  handle.notify("Right Ctrl hides/shows this window. A floating 'Open Auto-Trade' button appears when minimized.")
   return handle
 end
 
@@ -1693,7 +1820,7 @@ end)()
 -- (workspace.__THINGS.__REMOTES + Framework.Library) and builds its own WindUI.
 local CONFIG = {
   feedUrl = "https://raw.githubusercontent.com/0xfray/Mr-script/refs/heads/main/MR/value.lua",
-  version = "v1.6-invoke",
+  version = "v1.7-tradefind",
 }
 
 local libConfig  = __M["lib.config"]
@@ -1715,7 +1842,7 @@ local cooldownLib= __M["lib.cooldown"]
 local tradefields= __M["lib.tradefields"]
 local ui         = __M["runtime.ui"]
 
-local dbg = LogBuf.new(600)
+local dbg = LogBuf.new(1200)
 local function nows() return string.format("%.2fs", os.clock()) end
 local function logp(t) print("[AutoTrade] " .. t); dbg:info(t, nows()) end
 local function logstep(t) print("[AutoTrade] * " .. t); dbg:step(t, nows()) end
@@ -1805,7 +1932,15 @@ if remotes and rroot then
   local latestStatus
   local pollOkN, pollFailN, pollStreakFail, lastPollErr = 0, 0, 0, nil
   local dumpedStatus, dumpedAT, dumpedInvite = false, false, false
-  local function getActiveTrade() return latestStatus and latestStatus.activeTrade end
+  local loggedTradeKey = false
+  local function getActiveTrade()
+    local at, key = gamedata.findActiveTrade(latestStatus)
+    if at and not loggedTradeKey then
+      loggedTradeKey = true
+      logp("active trade object found under status." .. tostring(key))
+    end
+    return at
+  end
   local function getGems() return gamedata.gems() end
   local function sendTradeMsg(text) pcall(function() remotes.trading_sendmessage:FireServer(text) end) end
 
@@ -1869,6 +2004,8 @@ if remotes and rroot then
   local runner = TradeM.new({
     remotes = remotes, cfg = cfg, feed = feed, catalog = catalog,
     getActiveTrade = getActiveTrade, refreshStatus = refreshStatus, sendTradeMsg = sendTradeMsg,
+    myBusy = function() return gamedata.myBusy(latestStatus) end,
+    dumpFullStatus = function(label) logDump(label, latestStatus or {}) end,
     pickSellItem = pickSellItem, pickBuyItem = pickBuyItem,
     log = logp, mode = mode, onSold = onSold, onBought = onBought,
   })
@@ -1925,15 +2062,17 @@ if remotes and rroot then
     task.spawn(function() runner:handle({ active = true, uid = uid, player = player, name = player and player.Name or nil }) end)
   end
 
+  local busySkipLogged = {}
   local function processStatus(s)
     if type(s) ~= "table" then return end
     latestStatus = s
     if not dumpedStatus then dumpedStatus = true; logDump("status (trimmed)", { activeTrade = s.activeTrade, incomingInvites = s.incomingInvites, outgoingInvites = s.outgoingInvites }) end
-    if type(s.activeTrade) == "table" then
-      if not dumpedAT then dumpedAT = true; logDump("activeTrade fields", s.activeTrade) end
+    local at = (gamedata.findActiveTrade(s))
+    if type(at) == "table" then
+      if not dumpedAT then dumpedAT = true; logDump("activeTrade fields", at) end
       -- a trade window is already open (their accept, or our own outgoing
       -- invite got accepted) - drive it; never also dispatch invites now
-      tryHandleActiveTrade(s.activeTrade)
+      tryHandleActiveTrade(at)
       return
     end
     local inv = s.incomingInvites
@@ -1942,14 +2081,26 @@ if remotes and rroot then
         if not dumpedInvite then dumpedInvite = true; logDump("incomingInvites entry", (type(entry) == "table" and entry) or { value = entry }) end
         local uid = (type(entry) == "table" and (entry.uid or entry.id)) or key
         uid = tonumber(uid) or uid  -- one cooldown entry per player, string or number key
-        local player = gamedata.playerFromUid(uid)
-        if not player then
-          -- only a real Player instance is usable (as accept arg / blocklist
-          -- name); a raw table would FireServer garbage - fall back to the uid
-          local e = type(entry) == "table" and (entry.inviter or entry.player) or nil
-          if type(e) == "userdata" then player = e end
+        -- Skip inviters the server marks busy: they're mid-trade with someone
+        -- else and accepting their (stale) invite does nothing - observed live
+        -- as a 60s hang on "no active trade after accept".
+        local bp = s.busyPlayers
+        if type(bp) == "table" and (bp[uid] or bp[tostring(uid)]) then
+          if not busySkipLogged[uid] then
+            busySkipLogged[uid] = true
+            logp("skipping invite from busy (mid-trade) player uid=" .. tostring(uid))
+          end
+        else
+          busySkipLogged[uid] = nil
+          local player = gamedata.playerFromUid(uid)
+          if not player then
+            -- only a real Player instance is usable (as accept arg / blocklist
+            -- name); a raw table would FireServer garbage - fall back to the uid
+            local e = type(entry) == "table" and (entry.inviter or entry.player) or nil
+            if type(e) == "userdata" then player = e end
+          end
+          tryHandleInvite(uid, player)
         end
-        tryHandleInvite(uid, player)
       end
     end
   end
