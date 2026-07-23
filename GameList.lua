@@ -1,6 +1,7 @@
 local Games = {
   [4490140733] = "https://raw.githubusercontent.com/0xfray/Mr-script/refs/heads/main/MR/main.lua", -- My Restaurant
   [13200523806] = "https://raw.githubusercontent.com/0xfray/Mr-script/refs/heads/main/MR/plaza.lua" -- Trading Plaza
+  [13200523806] = "https://raw.githubusercontent.com/0xfray/Mr-script/refs/heads/main/MR/AutoTrade.lua" -- Trading Plaza
 }
 
 return Games
