@@ -95,13 +95,39 @@ function M.defaults()
     -- Discord webhook (url stored locally only; blank = disabled)
     webhook = { url = "", onSale = true, onCap = true, onDisconnect = true, onError = true },
 
+    -- Confirm gate + invites
+    requireBuyerConfirm = true,  -- only confirm once the buyer has confirmed
+    confirmVerifyTimeoutSec = 10, -- wait this long for the trade to clear after confirm
+    inviteCooldownSec = 120,     -- min seconds between auto-invites to the same player
+
     -- Housekeeping
     feedRefreshSec = 1800,    -- re-fetch the value feed every 30 min (0 = never)
-    expectedPlaceId = 13200523806, -- Trading Plaza; auto-trade only runs here
+    -- Array (not a set): numeric map keys don't survive the JSON persist round-trip.
+    expectedPlaceIds = { 13200523806, 13279398864 }, -- Trading Plaza, Pro Trading Plaza
   }
 end
 
--- Deep-merge override onto base (base is not mutated). Tables recurse; scalars replace.
+-- Is auto-trading allowed in this place? Honors the expectedPlaceIds allow-list
+-- plus a legacy scalar `expectedPlaceId` from old saved settings. No config at
+-- all = no restriction.
+function M.placeAllowed(cfg, placeId)
+  local pid = tonumber(placeId)
+  if not pid then return false end
+  local ids = (type(cfg) == "table") and cfg.expectedPlaceIds or nil
+  local legacy = (type(cfg) == "table") and tonumber(cfg.expectedPlaceId) or nil
+  local hasList = type(ids) == "table" and next(ids) ~= nil
+  if not hasList and not legacy then return true end -- no restriction configured
+  if hasList then
+    for _, v in ipairs(ids) do
+      if tonumber(v) == pid then return true end
+    end
+  end
+  return legacy == pid
+end
+
+-- Deep-merge override onto base (base is not mutated). Map tables recurse;
+-- scalars and ARRAYS replace wholesale (index-wise merging an array would make
+-- it impossible to ever shrink a saved list below the default length).
 function M.merge(base, override)
   local out = {}
   for k, v in pairs(base) do
@@ -109,7 +135,7 @@ function M.merge(base, override)
   end
   if type(override) == "table" then
     for k, v in pairs(override) do
-      if type(v) == "table" and type(out[k]) == "table" then
+      if type(v) == "table" and type(out[k]) == "table" and v[1] == nil then
         out[k] = M.merge(out[k], v)
       else
         out[k] = v
@@ -359,9 +385,21 @@ __M["lib.cooldown"] = (function()
 local M = {}
 
 -- Per-player gate: blocklist first, then a min-seconds-between-trades cooldown.
+-- `player` is either a scalar key or a { uid?, name? } table; the blocklist may
+-- be keyed by name, numeric uid, or stringified uid.
 -- Returns (allowed: bool, reason: string?).
+local function blocked(bl, player)
+  if not (bl and player) then return false end
+  if type(player) == "table" then
+    if player.name ~= nil and bl[player.name] then return true end
+    if player.uid ~= nil and (bl[player.uid] or bl[tostring(player.uid)]) then return true end
+    return false
+  end
+  return bl[player] ~= nil and bl[player] ~= false
+end
+
 function M.allow(cfg, player, lastTradeAt, now)
-  if cfg.blocklist and player and cfg.blocklist[player] then
+  if blocked(cfg.blocklist, player) then
     return false, "blocked"
   end
   local cd = tonumber(cfg.cooldownSec) or 0
@@ -570,19 +608,26 @@ __M["lib.tradefields"] = (function()
 -- Each reader returns (value, fieldNameUsed) so the caller can log what matched.
 local M = {}
 
-local function firstKnown(at, names)
+-- One scanner pair, parametrized by a coercion: coerce(raw) -> value|nil.
+local function coerceStrictNumber(v) if type(v) == "number" then return v end return nil end
+local function coerceBool(v) if type(v) == "boolean" then return v end return nil end
+
+local function firstKnown(at, names, coerce)
   for _, k in ipairs(names) do
-    local v = tonumber(at[k])
-    if v then return v, k end
+    local v = coerce(at[k])
+    if v ~= nil then return v, k end
   end
   return nil
 end
 
-local function fuzzyNumeric(at, mustA, mustB)
-  for k, v in pairs(at) do
-    if type(k) == "string" and type(v) == "number" then
-      local lk = k:lower()
-      if lk:find(mustA) and (not mustB or lk:find(mustB)) then return v, k end
+local function fuzzyScan(at, mustA, mustB, coerce)
+  for k, raw in pairs(at) do
+    if type(k) == "string" then
+      local v = coerce(raw)
+      if v ~= nil then
+        local lk = k:lower()
+        if lk:find(mustA) and (not mustB or lk:find(mustB)) then return v, k end
+      end
     end
   end
   return nil
@@ -591,9 +636,9 @@ end
 -- Gems the buyer (target/other player) has put into the window.
 function M.buyerGems(at)
   if type(at) ~= "table" then return 0, nil end
-  local v, k = firstKnown(at, { "sentGemsTarget", "offeredGemsTarget", "gemsTarget", "targetGems" })
+  local v, k = firstKnown(at, { "sentGemsTarget", "offeredGemsTarget", "gemsTarget", "targetGems" }, tonumber)
   if v then return v, k end
-  v, k = fuzzyNumeric(at, "gem", "target")
+  v, k = fuzzyScan(at, "gem", "target", coerceStrictNumber)
   if v then return v, k end
   return 0, nil
 end
@@ -601,11 +646,25 @@ end
 -- Gems we (the player) have put in.
 function M.myGems(at)
   if type(at) ~= "table" then return 0, nil end
-  local v, k = firstKnown(at, { "sentGemsPlayer", "offeredGemsPlayer", "gemsPlayer", "playerGems" })
+  local v, k = firstKnown(at, { "sentGemsPlayer", "offeredGemsPlayer", "gemsPlayer", "playerGems" }, tonumber)
   if v then return v, k end
-  v, k = fuzzyNumeric(at, "gem", "player")
+  v, k = fuzzyScan(at, "gem", "player", coerceStrictNumber)
   if v then return v, k end
   return 0, nil
+end
+
+-- Whether the buyer (target) has pressed confirm. Returns nil when no matching
+-- field exists (unknown - caller must NOT treat that as false-and-keep-waiting
+-- silently, and must NEVER treat it as confirmed).
+function M.targetConfirmed(at)
+  if type(at) ~= "table" then return nil, nil end
+  local v, k = firstKnown(at, { "targetConfirmed", "targetAccepted", "confirmedTarget" }, coerceBool)
+  if v ~= nil then return v, k end
+  v, k = fuzzyScan(at, "confirm", "target", coerceBool)
+  if v ~= nil then return v, k end
+  v, k = fuzzyScan(at, "accept", "target", coerceBool)
+  if v ~= nil then return v, k end
+  return nil, nil
 end
 
 -- The other player's user id.
@@ -665,10 +724,10 @@ local M = {}
 -- Core remotes the trade flow must have.
 local REQUIRED = { "trading_acceptinvite", "trading_additem", "trading_removeitem",
                    "trading_confirmtrade", "trading_abort", "trading_sendmessage" }
--- Extra remotes used for status/invites/offers (looked up but not fatal if absent).
-local OPTIONAL = { "trading_getstatus", "trading_invitesent", "trading_tradebegan",
-                   "trading_statuschange", "trading_updategemoffer", "trading_unaccept",
-                   "trading_cancelled", "trading_sendinvite" }
+-- Extra remotes (looked up but not fatal if absent). Only trading_sendinvite is
+-- real - the deob shows the game has NO status/invite events; status comes from
+-- Library.Network.Invoke("Trading_GetStatus") (see gamedata.getStatus).
+local OPTIONAL = { "trading_sendinvite" }
 
 function M.resolveRemotes(timeout)
   timeout = timeout or 30
@@ -714,25 +773,6 @@ function M.resolveRemotes(timeout)
     return out2, "search:" .. remotes:GetFullName()
   end
   return nil, "no __THINGS.__REMOTES found"
-end
-
-function M.loadBase(baseUrl)
-  local ok, res = pcall(function() return loadstring(game:HttpGet(baseUrl))() end)
-  return ok, res
-end
-
-function M.disableBaseSmartTradeFile()
-  local ok = pcall(function()
-    local HttpService = game:GetService("HttpService")
-    local name = Players.LocalPlayer.Name
-    local path = "OdResto/Trade-" .. name .. ".json"
-    if isfile and isfile(path) and readfile and writefile then
-      local t = HttpService:JSONDecode(readfile(path))
-      t.smartTrade = false
-      writefile(path, HttpService:JSONEncode(t))
-    end
-  end)
-  return ok
 end
 
 return M
@@ -790,51 +830,93 @@ function M.gems()
 end
 
 -- Unwrap a status payload to the object holding incomingInvites/activeTrade.
--- The game wraps it one level deep ({ { status } }); handle both.
-function M.unwrapStatus(a)
-  if type(a) ~= "table" then return nil end
-  if a.incomingInvites ~= nil or a.activeTrade ~= nil then return a end
-  local inner = a[1]
-  if type(inner) == "table" and (inner.incomingInvites ~= nil or inner.activeTrade ~= nil) then return inner end
-  return nil
+-- Network.Invoke returns the table directly, but stay tolerant of a one-level
+-- wrap and of an idle status that has none of the known keys (pass it through
+-- so the one-time dump in main reveals the real shape).
+local function looksLikeStatus(t)
+  return type(t) == "table" and (t.incomingInvites ~= nil or t.activeTrade ~= nil
+    or t.outgoingInvites ~= nil or t.tradeUID ~= nil)
 end
 
--- Current trade status via the trading_getstatus RemoteFunction (unwrapped).
-function M.getStatus(remotes)
-  local rf = remotes and remotes.trading_getstatus
-  if not rf then return nil end
-  local ok, res = pcall(function() return rf:InvokeServer() end)
-  if not ok then return nil end
-  return M.unwrapStatus(res)
+function M.unwrapStatus(a)
+  if type(a) ~= "table" then return nil end
+  if looksLikeStatus(a) then return a end
+  if looksLikeStatus(a[1]) then return a[1] end
+  if next(a) == nil then return a end -- empty table = idle status, harmless
+  return nil -- unrecognized shape: NOT a healthy poll (may be an error payload)
+end
+
+-- Current trade status via the framework network layer (the game's ONLY status
+-- mechanism - there is no trading_getstatus remote). Confirmed from the deob:
+-- Library.Network.Invoke is a plain function, the remote NAME is its first
+-- argument (dot-call; a colon-call would shift the args and break it).
+-- Returns (status) | (nil, err) | (nil, err, rawTable) - raw lets the caller
+-- dump an unrecognized shape once for diagnosis.
+function M.getStatus(root)
+  local net = root and root.Network
+  local inv = type(net) == "table" and net.Invoke or nil
+  if type(inv) ~= "function" then return nil, "no Network.Invoke on Library root" end
+  local ok, res = pcall(inv, "Trading_GetStatus")
+  if not ok then return nil, tostring(res) end
+  if type(res) ~= "table" then return nil, "status is " .. type(res) end
+  local s = M.unwrapStatus(res)
+  if not s then return nil, "unrecognized status shape", res end
+  return s, nil
+end
+
+-- Resolve a live Player from an invite uid.
+function M.playerFromUid(uid)
+  local n = tonumber(uid)
+  if not n then return nil end
+  local ok, p = pcall(function() return Players:GetPlayerByUserId(n) end)
+  return ok and p or nil
 end
 
 return M
 
 end)()
 __M["runtime.inventory"] = (function()
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local M = {}
 
--- Returns { [SetName] = qty } for tradeable items the player owns.
--- Uses the game's Framework.Library, mirroring how the base reads inventory.
--- CONFIRM IN-GAME: the exact Library accessor + entry shape (see Task 10 checklist).
-function M.owned()
-  local out = {}
+-- Returns { [name] = qty } for items the player owns, or nil when the
+-- inventory can't be read (unknown - callers must not treat that as "owns
+-- nothing"). Reads Library.Inventory.<Class> tables straight off the required
+-- Framework Library root (same root gamedata uses; confirmed in the deob:
+-- plaza iterates Library.Inventory.Furniture / .Appliance). Entries are mapped
+-- id -> name through the Directory catalog built by gamedata.catalog.
+local cachedCatalog, cachedById
+function M.owned(root, catalog)
+  if type(root) ~= "table" or type(catalog) ~= "table" then return nil end
+  -- the catalog is immutable after startup; build the reverse index once
+  if catalog ~= cachedCatalog then
+    cachedById = {}
+    for name, c in pairs(catalog) do
+      if c and c.id then cachedById[tostring(c.id)] = name end
+    end
+    cachedCatalog = catalog
+  end
+  local byId = cachedById
+  local out
   local ok = pcall(function()
-    local fw = ReplicatedStorage:WaitForChild("Framework", 10)
-    local Library = require(fw):Library()          -- shape confirmed in-game
-    local inv = Library.Inventory or (Library.GetInventory and Library:GetInventory())
+    local inv = root.Inventory
     if type(inv) ~= "table" then return end
-    for _, entry in pairs(inv) do
-      if type(entry) == "table" then
-        local name = entry.class or entry.Name
-        if name then
-          out[name] = (out[name] or 0) + (entry.count or entry.targetQty or 1)
+    out = {}
+    for _, classTbl in pairs(inv) do
+      if type(classTbl) == "table" then
+        for _, entry in pairs(classTbl) do
+          if type(entry) == "table" then
+            local id = entry.id or entry.ID or entry.itemID
+            local name = id and byId[tostring(id)]
+            if name then
+              local qty = tonumber(entry.amount or entry.count or entry.qty) or 1
+              out[name] = (out[name] or 0) + qty
+            end
+          end
         end
       end
     end
   end)
-  if not ok then return {} end
+  if not ok then return nil end
   return out
 end
 
@@ -845,6 +927,7 @@ __M["runtime.prober"] = (function()
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local dump = __M["lib.dump"]
+local gamedata = __M["runtime.gamedata"]
 local M = {}
 
 local function has(fn) return type(fn) == "function" end
@@ -933,6 +1016,33 @@ function M.run(log, t)
         log:ok(catego .. " count = " .. n, t)
       end
     end
+  end)
+
+  -- TRADING STATUS: exercise the exact same path the trade loop uses
+  -- (gamedata.getStatus -> Library.Network.Invoke("Trading_GetStatus")) so the
+  -- probe can't pass while live polling is broken.
+  safe(log, "trading-status", t, function()
+    local fw = ReplicatedStorage:FindFirstChild("Framework")
+    local libmod = fw and fw:FindFirstChild("Library")
+    if not libmod then log:warn("no Framework.Library (status probe skipped)", t); return end
+    local ok, root = pcall(require, libmod)
+    if not ok or type(root) ~= "table" then log:err("Library require failed in status probe", t); return end
+    local net = root.Network
+    log:info("Network type = " .. type(net) .. ", Invoke type = " .. type(type(net) == "table" and net.Invoke or nil), t)
+    local status, serr, raw = gamedata.getStatus(root)
+    if not status then
+      log:err("Trading_GetStatus poll FAILED: " .. tostring(serr), t)
+      if type(raw) == "table" then logDump(log, "raw status payload", raw, t, { maxDepth = 2, maxKeys = 40 }) end
+      return
+    end
+    logDump(log, "Trading_GetStatus", status, t, { maxDepth = 2, maxKeys = 40 })
+    if type(status.activeTrade) == "table" then
+      logDump(log, "status.activeTrade", status.activeTrade, t, { maxDepth = 2, maxKeys = 40 })
+    end
+    if type(status.incomingInvites) == "table" then
+      logDump(log, "status.incomingInvites", status.incomingInvites, t, { maxDepth = 2, maxKeys = 20 })
+    end
+    log:ok("Trading_GetStatus poll works", t)
   end)
 
   -- chat channel
@@ -1040,9 +1150,11 @@ local tf = __M["lib.tradefields"]
 
 local M = {}
 
--- deps: { remotes, cfg, feed, catalog, getActiveTrade, pickSellItem, pickBuyItem,
---         sendTradeMsg, log, mode, onSold, onBought }
-function M.new(deps) return setmetatable({ d = deps, busy = false, loggedField = false }, { __index = M }) end
+-- deps: { remotes, cfg, feed, catalog, getActiveTrade, refreshStatus,
+--         pickSellItem, pickBuyItem, sendTradeMsg, log, mode, onSold, onBought }
+function M.new(deps)
+  return setmetatable({ d = deps, busy = false, loggedField = false, loggedConfirmField = false }, { __index = M })
+end
 
 -- Robust buyer-gems read; logs which field matched, once.
 function M:buyerGems(at)
@@ -1052,6 +1164,84 @@ function M:buyerGems(at)
     self.d.log("buyer-gems field = '" .. tostring(field) .. "'")
   end
   return g
+end
+
+-- Robust "other player pressed confirm" read; logs which field matched, once.
+-- nil = no matching field found (unknown) - callers must never confirm on it.
+function M:targetConfirmed(at)
+  local v, field = tf.targetConfirmed(at)
+  if field and not self.loggedConfirmField then
+    self.loggedConfirmField = true
+    self.d.log("target-confirm field = '" .. tostring(field) .. "'")
+  end
+  return v
+end
+
+-- Live activeTrade via a fresh status poll; falls back to the cached status
+-- when the poll itself fails.
+function M:freshTrade()
+  local d = self.d
+  if d.refreshStatus then
+    local s = d.refreshStatus()
+    if type(s) == "table" then return s.activeTrade end
+  end
+  return d.getActiveTrade()
+end
+
+-- Wait until the other player presses confirm (the game's own vendor script
+-- gates on targetConfirmed before firing trading_confirmtrade). Gets its OWN
+-- full window - negotiation time already spent must not shrink the human
+-- buyer's time to press confirm. minGems: also abort if their offered gems
+-- drop below it (sell mode). Returns true, or (false, reason).
+function M:waitTargetConfirm(minGems)
+  local d = self.d
+  local warned = false
+  local t0 = os.time()
+  while os.time() - t0 <= (d.cfg.tradeTimeoutSec or 60) do
+    local at = self:freshTrade()
+    if type(at) ~= "table" then return false, "trade vanished while waiting for confirm" end
+    if minGems then
+      local bg = self:buyerGems(at)
+      if bg < minGems then
+        return false, ("buyer lowered gems to %s (required %s)"):format(tostring(bg), tostring(minGems))
+      end
+    end
+    local confirmed = self:targetConfirmed(at)
+    if confirmed == true then return true end
+    if confirmed == nil and not warned then
+      warned = true
+      d.log("no target-confirm field on activeTrade - will time out rather than blind-confirm")
+    end
+    task.wait(0.5)
+  end
+  return false, "timeout waiting for other player to confirm"
+end
+
+-- After firing confirm, wait for the trade to actually complete (activeTrade
+-- clears or tradeUID changes) before the sale/buy is recorded. Judges ONLY on
+-- fresh successful polls - a failed poll must not be mistaken for "no change"
+-- (or the cached still-open trade would suppress recording a completed sale).
+function M:verifyCompletion(prevUID)
+  local d = self.d
+  local deadline = os.time() + (d.cfg.confirmVerifyTimeoutSec or 10)
+  while os.time() <= deadline do
+    task.wait(0.5)
+    local s = d.refreshStatus and d.refreshStatus()
+    if type(s) == "table" then
+      local at = s.activeTrade
+      if type(at) ~= "table" then return true end
+      if prevUID ~= nil and at.tradeUID ~= nil and at.tradeUID ~= prevUID then return true end
+    end
+  end
+  return false
+end
+
+-- Shared confirm protocol: capture the trade uid, fire the confirm remote,
+-- verify completion. Returns true only when the trade demonstrably finished.
+function M:confirmTrade(fresh)
+  local prevUID = (type(fresh) == "table") and fresh.tradeUID or nil
+  self.d.remotes.trading_confirmtrade:FireServer()
+  return self:verifyCompletion(prevUID)
 end
 
 function M:handle(invite)
@@ -1077,17 +1267,19 @@ end
 function M:waitForTrade(timeout)
   local start = os.time()
   repeat
-    local at = self.d.getActiveTrade()
+    local at = self:freshTrade()
     if type(at) == "table" then return at end
     task.wait(0.4)
   until os.time() - start > (timeout or 60)
-  return self.d.getActiveTrade()
+  return self:freshTrade()
 end
 
 -- ---- SELL -------------------------------------------------------------------
 function M:runSell(invite)
   local d = self.d
-  self:accept(invite)
+  -- invite.active = trade already open (e.g. from our own outgoing invite);
+  -- accepting again would be wrong.
+  if not invite.active then self:accept(invite) end
   local at = self:waitForTrade(d.cfg.tradeTimeoutSec)
   if not at then return self:abort("no active trade after accept") end
 
@@ -1113,26 +1305,39 @@ function M:runSell(invite)
 
   local start = os.time()
   for round = 0, (d.cfg.negotiation.maxRounds or 3) do
-    local cur = d.getActiveTrade() or at
+    local cur = self:freshTrade() or at
     local bg = self:buyerGems(cur)
     local decision = negotiation.decide(d.cfg, quote, { offeredGems = bg, round = round, elapsed = os.time() - start })
     d.log(("round %d: buyer=%s decision=%s"):format(round, tostring(bg), decision.action))
 
     if decision.action == "ACCEPT" then
-      local fresh = d.getActiveTrade() or cur
-      local fg = self:buyerGems(fresh)
       local required = math.max(negotiation.threshold(d.cfg, quote, round), hardFloor)
-      if fg < required then
+      local fresh = self:freshTrade() or cur
+      local fg = self:buyerGems(fresh)
+      if not scamguard.safeToConfirmSell(required, fg) then
         return self:abort(("safety: buyer %s < required %s (hardFloor %s)"):format(tostring(fg), tostring(required), tostring(hardFloor)))
       end
+      if d.cfg.requireBuyerConfirm then
+        local okc, why = self:waitTargetConfirm(required)
+        if not okc then return self:abort(why) end
+      end
+      -- fresh read immediately before confirm (mirrors the game's own vendor)
+      fresh = self:freshTrade() or fresh
+      fg = self:buyerGems(fresh)
+      if not scamguard.safeToConfirmSell(required, fg) then
+        return self:abort(("safety: buyer dropped to %s < required %s at confirm"):format(tostring(fg), tostring(required)))
+      end
       if d.cfg.testMode then
-        d.log(("TEST MODE: WOULD SELL %s for %s gems - not confirming"):format(setName, tostring(fg)))
+        d.log(("TEST MODE: WOULD SELL %s for %s gems (buyerConfirmed=%s) - not confirming"):format(
+          setName, tostring(fg), tostring(self:targetConfirmed(fresh))))
         task.wait(1)
         return self:abort("test mode (no confirm)")
       end
-      d.remotes.trading_confirmtrade:FireServer()
-      local cost = (marketVal or 0)
-      if d.onSold then d.onSold(setName, 1, fg, cost) end
+      if self:confirmTrade(fresh) then
+        if d.onSold then d.onSold(setName, 1, fg, marketVal or 0) end
+      else
+        d.log("confirm fired but trade did not complete in time - sale NOT recorded")
+      end
       return
     elseif decision.action == "COUNTER" then
       if d.sendTradeMsg then d.sendTradeMsg(decision.message) end
@@ -1150,7 +1355,7 @@ end
 -- ---- BUY (gem-cap mode) -----------------------------------------------------
 function M:runBuy(invite)
   local d = self.d
-  self:accept(invite)
+  if not invite.active then self:accept(invite) end
   local at = self:waitForTrade(d.cfg.tradeTimeoutSec)
   if not at then return self:abort("buy: no active trade") end
 
@@ -1163,20 +1368,33 @@ function M:runBuy(invite)
 
   local start = os.time()
   for round = 0, (d.cfg.negotiation.maxRounds or 3) do
-    local cur = d.getActiveTrade() or at
+    local cur = self:freshTrade() or at
     local ask = self:buyerGems(cur)
     local decision = negotiation.decideBuy(d.cfg, bq, { sellerAsk = ask, round = round, elapsed = os.time() - start })
     if decision.action == "ACCEPT" then
-      local fresh = d.getActiveTrade() or cur
+      local fresh = self:freshTrade() or cur
       if not scamguard.safeToConfirmBuy(bq.max, self:buyerGems(fresh)) then
         return self:abort("scam-guard: seller raised price")
       end
+      if d.cfg.requireBuyerConfirm then
+        local okc, why = self:waitTargetConfirm(nil)
+        if not okc then return self:abort("buy: " .. tostring(why)) end
+      end
+      fresh = self:freshTrade() or fresh
+      if not scamguard.safeToConfirmBuy(bq.max, self:buyerGems(fresh)) then
+        return self:abort("scam-guard: seller raised price at confirm")
+      end
+      local paid = self:buyerGems(fresh)
       if d.cfg.testMode then
-        d.log(("TEST MODE: WOULD BUY %s for %s - not confirming"):format(setName, tostring(self:buyerGems(fresh))))
+        d.log(("TEST MODE: WOULD BUY %s for %s (sellerConfirmed=%s) - not confirming"):format(
+          setName, tostring(paid), tostring(self:targetConfirmed(fresh))))
         return self:abort("test mode (no confirm)")
       end
-      d.remotes.trading_confirmtrade:FireServer()
-      if d.onBought then d.onBought(setName, 1, self:buyerGems(fresh)) end
+      if self:confirmTrade(fresh) then
+        if d.onBought then d.onBought(setName, 1, paid) end
+      else
+        d.log("confirm fired but buy did not complete in time - buy NOT recorded")
+      end
       return
     elseif decision.action == "COUNTER" then
       if d.sendTradeMsg then d.sendTradeMsg(decision.message) end
@@ -1240,37 +1458,85 @@ local function buildListings(cfg, feed, owned)
 end
 M.buildListings = buildListings
 
--- deps: { cfg, feed, ownedFn, log }
+-- deps: { cfg, feed, ownedFn, log, remotes, isBusy, hasActiveTrade }
 function M.start(deps)
   local cfg = deps.cfg
-  local warnedOff = false
+
+  -- Ad loop. Chat sends go through the filter + rate limits and spam is an
+  -- account-ban vector, so the interval is floored at 45s.
+  local warnedOff, warnedNoInv = false, false
   task.spawn(function()
     while true do
       if cfg.enabled and cfg.ads.rotatingAds then
         warnedOff = false
-        local owned = cfg.ads.stockOnly and deps.ownedFn() or nil
-        local listings = buildListings(cfg, deps.feed, owned)
-        local line = ads.line(listings, { maxItems = 5 })
-        if line then
-          local ok, err = sendChat(line)
-          deps.log(ok and ("Ad sent: " .. line) or ("Ad FAILED (chat): " .. tostring(err)))
-        else
-          deps.log("Ad skipped: nothing marked For Sale (in stock)")
+        local skip = false
+        local owned = nil
+        if cfg.ads.stockOnly then
+          owned = deps.ownedFn and deps.ownedFn() or nil
+          if owned == nil then
+            -- fail CLOSED: never advertise stock we can't verify we hold
+            skip = true
+            if not warnedNoInv then
+              warnedNoInv = true
+              deps.log("inventory unknown - skipping stock-only ads (turn off 'In-Stock Only' to advertise anyway)")
+            end
+          end
+        end
+        if not skip then
+          local listings = buildListings(cfg, deps.feed, owned)
+          local line = ads.line(listings, { maxItems = 5 })
+          if line then
+            local ok, err = sendChat(line)
+            deps.log(ok and ("Ad sent: " .. line) or ("Ad FAILED (chat): " .. tostring(err)))
+          else
+            deps.log("Ad skipped: nothing marked For Sale (in stock)")
+          end
         end
       elseif cfg.enabled and not cfg.ads.rotatingAds and not warnedOff then
         warnedOff = true
         deps.log("Ads OFF (turn on 'Rotating Chat Ads' to advertise)")
       end
-      if cfg.enabled and cfg.ads.autoInvite then
+      task.wait(math.max(45, cfg.ads.intervalSec or 45))
+    end
+  end)
+
+  -- Auto-invite loop: trading_sendinvite:FireServer(player) is a real remote
+  -- (the game's own script uses it). Only fires when idle, per-player cooldown,
+  -- never to blocklisted players.
+  local lastInvited = {}
+  local function isBlocklisted(plr)
+    local bl = cfg.blocklist
+    return bl and (bl[plr.Name] or bl[plr.UserId] or bl[tostring(plr.UserId)]) and true or false
+  end
+  task.spawn(function()
+    while true do
+      task.wait(15)
+      if cfg.enabled and cfg.ads.autoInvite
+        and deps.remotes and deps.remotes.trading_sendinvite
+        and not (deps.isBusy and deps.isBusy())
+        and not (deps.hasActiveTrade and deps.hasActiveTrade()) then
         pcall(function()
+          local now = os.time()
+          local window = cfg.inviteCooldownSec or 120
+          for uid, at in pairs(lastInvited) do -- keep the 24/7 table bounded
+            if (now - at) > window then lastInvited[uid] = nil end
+          end
+          local sent = 0
           for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= Players.LocalPlayer then
-              -- CONFIRM IN-GAME: the game's trade-invite request path.
+            if sent >= 5 then break end
+            if plr ~= Players.LocalPlayer and not isBlocklisted(plr) then
+              local last = lastInvited[plr.UserId]
+              if not last or (now - last) >= window then
+                deps.remotes.trading_sendinvite:FireServer(plr)
+                lastInvited[plr.UserId] = now
+                sent = sent + 1
+                deps.log("invited " .. plr.Name)
+                task.wait(0.5)
+              end
             end
           end
         end)
       end
-      task.wait(math.max(20, cfg.ads.intervalSec or 45))
     end
   end)
 end
@@ -1398,6 +1664,10 @@ function M.build(deps)
     Callback = function(txt) cfg.buyDiscountPct = tonumber(txt) or cfg.buyDiscountPct; save(cfg) end })
   Safety:Input({ Title = "Player Cooldown sec (default 30)",
     Callback = function(txt) cfg.cooldownSec = tonumber(txt) or cfg.cooldownSec; save(cfg) end })
+  Safety:Toggle({ Title = "Require Buyer Confirm (recommended)", Value = cfg.requireBuyerConfirm ~= false,
+    Callback = function(v) cfg.requireBuyerConfirm = v; save(cfg) end })
+  Safety:Input({ Title = "Invite Cooldown sec (default 120)",
+    Callback = function(txt) cfg.inviteCooldownSec = tonumber(txt) or cfg.inviteCooldownSec; save(cfg) end })
   Safety:Toggle({ Title = "Auto-Reconnect", Value = cfg.survival.autoReconnect,
     Callback = function(v) cfg.survival.autoReconnect = v; save(cfg) end })
   Safety:Toggle({ Title = "Anti-AFK", Value = cfg.survival.antiAfk,
@@ -1423,7 +1693,7 @@ end)()
 -- (workspace.__THINGS.__REMOTES + Framework.Library) and builds its own WindUI.
 local CONFIG = {
   feedUrl = "https://raw.githubusercontent.com/0xfray/Mr-script/refs/heads/main/MR/value.lua",
-  version = "v1.5-vend",
+  version = "v1.6-invoke",
 }
 
 local libConfig  = __M["lib.config"]
@@ -1442,6 +1712,7 @@ local advertiser = __M["runtime.advertiser"]
 local survival   = __M["runtime.survival"]
 local webhookSend= __M["runtime.webhook_send"]
 local cooldownLib= __M["lib.cooldown"]
+local tradefields= __M["lib.tradefields"]
 local ui         = __M["runtime.ui"]
 
 local dbg = LogBuf.new(600)
@@ -1476,10 +1747,10 @@ local function copyReport()
 end
 
 -- ---- connect to the game -----------------------------------------------------
-local wrongPlace = cfg.expectedPlaceId and game.PlaceId ~= cfg.expectedPlaceId
+local wrongPlace = not libConfig.placeAllowed(cfg, game.PlaceId)
 local remotes, rroot, catalog
 if wrongPlace then
-  logwarn(("WRONG GAME: place=%s (need Trading Plaza %s)"):format(tostring(game.PlaceId), tostring(cfg.expectedPlaceId)))
+  logwarn(("WRONG GAME: place=%s (need Trading Plaza 13200523806 or Pro Plaza 13279398864)"):format(tostring(game.PlaceId)))
 else
   logstep("resolving remotes (workspace.__THINGS.__REMOTES)")
   local rerr; remotes, rerr = remotesM.resolveRemotes(20)
@@ -1519,8 +1790,8 @@ local uiHandle = ui.build({ cfg = cfg, feed = feed, vendItems = vendItems,
 if uiHandle then logok("WindUI panel loaded") else logwarn("WindUI panel FAILED to load") end
 local function setStatus(t) if uiHandle and uiHandle.setStatus then uiHandle.setStatus(t) end end
 if wrongPlace then
-  setStatus("Wrong game. Open Trading Plaza (13200523806), then reload.")
-  if uiHandle and uiHandle.notify then uiHandle.notify("Open Trading Plaza to trade.") end
+  setStatus("Wrong game. Open the Trading Plaza (13200523806) or Pro Plaza (13279398864), then reload.")
+  if uiHandle and uiHandle.notify then uiHandle.notify("Open a Trading Plaza to trade.") end
 end
 
 survival.startAntiAfk(cfg); survival.startReconnect(cfg, onEvent)
@@ -1532,10 +1803,34 @@ if remotes and rroot then
   logok("item catalog built (" .. tostring(catCount) .. " ids)")
 
   local latestStatus
+  local pollOkN, pollFailN, pollStreakFail, lastPollErr = 0, 0, 0, nil
   local dumpedStatus, dumpedAT, dumpedInvite = false, false, false
   local function getActiveTrade() return latestStatus and latestStatus.activeTrade end
   local function getGems() return gamedata.gems() end
   local function sendTradeMsg(text) pcall(function() remotes.trading_sendmessage:FireServer(text) end) end
+
+  -- Live status poll: Library.Network.Invoke("Trading_GetStatus") - the game's
+  -- ONLY status source (there are no status remotes/events). Tracks health so
+  -- the debug report proves whether polling works. A short staleness cache
+  -- keeps the 1s loop and the in-trade 0.4-0.5s waits sharing one result
+  -- stream instead of each hitting the rate-limited server.
+  local lastPollOkClock, dumpedBadStatus = nil, false
+  local function refreshStatus()
+    if latestStatus and lastPollOkClock and (os.clock() - lastPollOkClock) < 0.4 then
+      return latestStatus
+    end
+    local s, serr, raw = gamedata.getStatus(rroot)
+    if s then
+      pollOkN = pollOkN + 1; pollStreakFail = 0; lastPollOkClock = os.clock()
+      if pollOkN == 1 then logok("status poll OK (Network.Invoke Trading_GetStatus)") end
+      latestStatus = s
+    else
+      pollFailN = pollFailN + 1; pollStreakFail = pollStreakFail + 1; lastPollErr = serr
+      if raw and not dumpedBadStatus then dumpedBadStatus = true; logDump("unrecognized status shape", raw) end
+      if pollStreakFail == 10 then logwarn("status poll failed 10x in a row: " .. tostring(serr)) end
+    end
+    return s
+  end
 
   local function isSellable(name) return name and catalog[name] and feed[name] and feed[name].value end
   local function pickSellItem(_at)
@@ -1573,78 +1868,117 @@ if remotes and rroot then
 
   local runner = TradeM.new({
     remotes = remotes, cfg = cfg, feed = feed, catalog = catalog,
-    getActiveTrade = getActiveTrade, sendTradeMsg = sendTradeMsg,
+    getActiveTrade = getActiveTrade, refreshStatus = refreshStatus, sendTradeMsg = sendTradeMsg,
     pickSellItem = pickSellItem, pickBuyItem = pickBuyItem,
     log = logp, mode = mode, onSold = onSold, onBought = onBought,
   })
 
   -- one gated + busy-aware dispatcher (stops the invite spam)
   local cooldownState = {}
-  local function gate(uid)
-    local t = os.time(); local okg = cooldownLib.allow(cfg, uid, cooldownState[uid], t)
-    if okg then cooldownState[uid] = t end; return okg
+  local function gate(uid, name)
+    uid = tonumber(uid) or uid -- one key per player whether ids arrive as string or number
+    local t = os.time()
+    -- prune stale entries so a 24/7 session doesn't grow this forever
+    for k, at in pairs(cooldownState) do
+      if (t - at) > math.max(300, (cfg.cooldownSec or 30) * 4) then cooldownState[k] = nil end
+    end
+    local okg, reason = cooldownLib.allow(cfg, { uid = uid, name = name }, cooldownState[uid], t)
+    if okg then cooldownState[uid] = t end
+    return okg, reason
   end
   local function playerName(p)
     if type(p) == "userdata" then local ok, n = pcall(function() return p.Name end); return ok and n or "?" end
     return tostring(p)
   end
+  -- Handlers run in task.spawn so the 1s status poll keeps running mid-trade
+  -- (runner.busy is set before any yield, so no double-dispatch).
   local function tryHandleInvite(uid, player)
     if not cfg.enabled or not uid or runner.busy then return end
-    if not gate(uid) then return end
-    logp(("HANDLING invite from %s uid=%s"):format(playerName(player), tostring(uid)))
-    runner:handle({ uid = uid, player = player, name = playerName(player) })
+    local name = playerName(player)
+    if not gate(uid, player and name or nil) then return end
+    logp(("HANDLING invite from %s uid=%s"):format(name, tostring(uid)))
+    task.spawn(function() runner:handle({ uid = uid, player = player, name = name }) end)
+  end
+  local lastActiveDispatch = 0
+  local function tryHandleActiveTrade(at)
+    if not cfg.enabled or runner.busy then return end
+    if os.time() - lastActiveDispatch < 10 then return end -- throttle (esp. when uid is unknown)
+    local uid = tradefields.partnerId(at)
+    local player = uid and gamedata.playerFromUid(uid) or nil
+    if uid then
+      local okg, reason = gate(uid, player and player.Name or nil)
+      if not okg then
+        if reason == "blocked" then
+          -- blocklisted partner holds a window open: decline it instead of
+          -- deadlocking (processStatus skips invites while any trade is open).
+          -- Cooldown-gated partners are NOT aborted - that gate self-expires
+          -- and aborting could cancel a just-completed trade's countdown.
+          lastActiveDispatch = os.time()
+          logp("declining active trade with BLOCKED partner uid=" .. tostring(uid))
+          pcall(function() remotes.trading_abort:FireServer() end)
+        end
+        return
+      end
+    end
+    lastActiveDispatch = os.time()
+    logp("HANDLING active trade" .. (player and (" with " .. player.Name) or "") .. " uid=" .. tostring(uid))
+    task.spawn(function() runner:handle({ active = true, uid = uid, player = player, name = player and player.Name or nil }) end)
   end
 
   local function processStatus(s)
     if type(s) ~= "table" then return end
     latestStatus = s
     if not dumpedStatus then dumpedStatus = true; logDump("status (trimmed)", { activeTrade = s.activeTrade, incomingInvites = s.incomingInvites, outgoingInvites = s.outgoingInvites }) end
-    if type(s.activeTrade) == "table" and not dumpedAT then dumpedAT = true; logDump("activeTrade fields", s.activeTrade) end
+    if type(s.activeTrade) == "table" then
+      if not dumpedAT then dumpedAT = true; logDump("activeTrade fields", s.activeTrade) end
+      -- a trade window is already open (their accept, or our own outgoing
+      -- invite got accepted) - drive it; never also dispatch invites now
+      tryHandleActiveTrade(s.activeTrade)
+      return
+    end
     local inv = s.incomingInvites
     if type(inv) == "table" then
-      for uid, entry in pairs(inv) do
+      for key, entry in pairs(inv) do
         if not dumpedInvite then dumpedInvite = true; logDump("incomingInvites entry", (type(entry) == "table" and entry) or { value = entry }) end
-        tryHandleInvite(uid, (type(entry) == "table" and (entry.inviter or entry.player)) or nil)
+        local uid = (type(entry) == "table" and (entry.uid or entry.id)) or key
+        uid = tonumber(uid) or uid  -- one cooldown entry per player, string or number key
+        local player = gamedata.playerFromUid(uid)
+        if not player then
+          -- only a real Player instance is usable (as accept arg / blocklist
+          -- name); a raw table would FireServer garbage - fall back to the uid
+          local e = type(entry) == "table" and (entry.inviter or entry.player) or nil
+          if type(e) == "userdata" then player = e end
+        end
+        tryHandleInvite(uid, player)
       end
     end
-  end
-
-  local function connectStatus(name)
-    local r = remotes[name]
-    if r and r.OnClientEvent then r.OnClientEvent:Connect(function(a) processStatus(gamedata.unwrapStatus(a)) end); logok("listening on " .. name) end
-  end
-  connectStatus("trading_statuschange"); connectStatus("trading_tradebegan")
-
-  local dumpedInviteEvt = false
-  if remotes.trading_invitesent then
-    remotes.trading_invitesent.OnClientEvent:Connect(function(...)
-      local args = { ... }
-      if not dumpedInviteEvt then dumpedInviteEvt = true; logDump("trading_invitesent args", args) end
-      local a = args[1]; local inviter = (type(a) == "table" and a[1]) or a
-      local uid
-      if type(inviter) == "userdata" then pcall(function() uid = inviter.UserId end)
-      elseif type(inviter) == "table" then uid = inviter.uid or inviter.id or inviter.UserId else uid = inviter end
-      tryHandleInvite(uid, inviter)
-    end)
-    logok("listening on trading_invitesent")
   end
 
   local ticks = 0
   survival.watchdog(cfg, "trade-loop", function()
     while true do
       ticks = ticks + 1
-      local s = gamedata.getStatus(remotes)
+      local s = refreshStatus()
       if s then processStatus(s) end
       if ticks % 15 == 1 then
-        logp(("heartbeat: enabled=%s testMode=%s vend=%s busy=%s activeTrade=%s gems=%s"):format(
+        local nInv = 0
+        local inv = latestStatus and latestStatus.incomingInvites
+        if type(inv) == "table" then for _ in pairs(inv) do nInv = nInv + 1 end end
+        logp(("heartbeat: enabled=%s testMode=%s vend=%s busy=%s activeTrade=%s gems=%s poll=%d/%d invites=%d%s"):format(
           tostring(cfg.enabled), tostring(cfg.testMode), tostring(cfg.activeVendItem ~= "" and cfg.activeVendItem or "(auto)"),
-          tostring(runner.busy), tostring(getActiveTrade() ~= nil), tostring(getGems())))
+          tostring(runner.busy), tostring(getActiveTrade() ~= nil), tostring(getGems()),
+          pollOkN, pollFailN, nInv,
+          (pollStreakFail > 0 and lastPollErr) and (" lastPollErr=" .. tostring(lastPollErr)) or ""))
       end
       task.wait(1)
     end
   end, onEvent)
 
-  advertiser.start({ cfg = cfg, feed = feed, ownedFn = inventory.owned, log = logp })
+  advertiser.start({ cfg = cfg, feed = feed, log = logp,
+    ownedFn = function() return inventory.owned(rroot, catalog) end,
+    remotes = remotes,
+    isBusy = function() return runner.busy end,
+    hasActiveTrade = function() return getActiveTrade() ~= nil end })
   setStatus("Ready. Trading " .. (cfg.enabled and "ENABLED" or "disabled") .. (cfg.testMode and " (TEST)" or "") .. ".")
   logok("trading wired")
 elseif not wrongPlace then
