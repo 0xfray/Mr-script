@@ -1,4 +1,4 @@
--- Universal Auto-Trade v1.15-messages  |  bundled by tools/bundle.py - do not edit.
+-- Universal Auto-Trade v1.16-trademsg  |  bundled by tools/bundle.py - do not edit.
 -- Source of truth: src/*.lua  (regenerate: python tools/bundle.py)
 local __M = {}
 __M["lib.parse"] = (function()
@@ -173,8 +173,8 @@ function M.defaults()
     -- Editable chat messages. Tokens: ad uses {items}; trade uses {item},
     -- {price} (short e.g. 750k) and {priceRaw} (the number).
     messages = {
-      ad    = "Selling: {items} — msg me",
-      trade = "Selling {item} for {price} gems — add gems and confirm!",
+      ad    = "Selling: {items} - msg me",
+      trade = "Selling {item} for {price} gems - add gems and confirm!",
     },
     items = {},               -- [name] = { value?, markupPct?, bandPct?, forSale? }
 
@@ -1691,11 +1691,13 @@ function M:runSell(invite)
   elseif not self:addItem(setName) then
     return self:abort("could not add " .. setName)
   end
-  if d.sendTradeMsg then
-    local template = (d.cfg.messages and d.cfg.messages.trade) or "Selling {item} for {price} gems — add gems and confirm!"
-    local msg = ads.render(template, { item = setName, price = ads.short(quote.ask), priceRaw = quote.ask })
-    if msg then d.sendTradeMsg(msg) end
+  -- the in-trade "how much" message (editable template)
+  local template = (d.cfg.messages and d.cfg.messages.trade) or "Selling {item} for {price} gems - add gems and confirm!"
+  local tradeMsg = ads.render(template, { item = setName, price = ads.short(quote.ask), priceRaw = quote.ask })
+  local function sayPrice()
+    if tradeMsg and d.sendTradeMsg then d.log("trade msg -> " .. tradeMsg); d.sendTradeMsg(tradeMsg) end
   end
+  sayPrice()
   d.log(("SELL %s | ask %s ceiling %s floor %s hardFloor %s | buyer has %s")
     :format(setName, tostring(quote.ask), tostring(quote.ceiling), tostring(quote.floor), tostring(hardFloor), tostring(self:buyerGems(at))))
 
@@ -1704,11 +1706,15 @@ function M:runSell(invite)
   -- `round` advances only on real haggling (chat counters), not passive waits.
   local start = os.time()
   local round = 0
+  local lastSay = os.time()
   while true do
     if os.time() - start > (d.cfg.tradeTimeoutSec or 60) then return self:abort("timeout waiting for buyer gems") end
     local cur = self:freshTrade()
     if type(cur) ~= "table" then return self:abort("trade window closed") end
     local bg = self:buyerGems(cur)
+    -- re-post the price every ~20s while the buyer hasn't paid enough, so a
+    -- late arrival still sees it
+    if bg < (quote.floor or 0) and (os.time() - lastSay) >= 20 then lastSay = os.time(); sayPrice() end
     local decision = negotiation.decide(d.cfg, quote, { offeredGems = bg, round = round, elapsed = os.time() - start })
     d.log(("round %d: buyer=%s decision=%s"):format(round, tostring(bg), decision.action))
 
@@ -1904,7 +1910,7 @@ function M.start(deps)
         end
         local listings = buildListings(cfg, deps.feed, owned)
         local items = ads.itemsText(listings, { maxItems = 5 })
-        local template = (cfg.messages and cfg.messages.ad) or "Selling: {items} — msg me"
+        local template = (cfg.messages and cfg.messages.ad) or "Selling: {items} - msg me"
         local line = items and ads.render(template, { items = items }) or nil
         if line then
           local ok, err, path = sendChat(line)
@@ -2018,12 +2024,12 @@ function M.build(deps)
   Messages:Paragraph({ Title = "Chat advertisement",
     Desc = "Public chat ad. Token: {items} = your for-sale list (e.g. \"Wave Chair 750k\")." })
   Messages:Input({ Title = "Ad message", Value = cfg.messages.ad or "",
-    Placeholder = "Selling: {items} — msg me",
+    Placeholder = "Selling: {items} - msg me",
     Callback = function(txt) if txt and txt ~= "" then cfg.messages.ad = txt; save(cfg) end end })
   Messages:Paragraph({ Title = "In-trade message",
     Desc = "Sent to the buyer when the item is added. Tokens: {item}, {price} (e.g. 750k), {priceRaw} (number)." })
   Messages:Input({ Title = "Trade message", Value = cfg.messages.trade or "",
-    Placeholder = "Selling {item} for {price} gems — add gems and confirm!",
+    Placeholder = "Selling {item} for {price} gems - add gems and confirm!",
     Callback = function(txt) if txt and txt ~= "" then cfg.messages.trade = txt; save(cfg) end end })
 
   local statusParagraph = Main:Paragraph({
@@ -2168,7 +2174,7 @@ end)()
 -- (workspace.__THINGS.__REMOTES + Framework.Library) and builds its own WindUI.
 local CONFIG = {
   feedUrl = "https://raw.githubusercontent.com/0xfray/Mr-script/refs/heads/main/MR/value.lua",
-  version = "v1.15-messages",
+  version = "v1.16-trademsg",
 }
 
 local libConfig  = __M["lib.config"]
