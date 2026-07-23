@@ -1,4 +1,4 @@
--- Universal Auto-Trade v1.10-busyfix  |  bundled by tools/bundle.py - do not edit.
+-- Universal Auto-Trade v1.11-oneshot  |  bundled by tools/bundle.py - do not edit.
 -- Source of truth: src/*.lua  (regenerate: python tools/bundle.py)
 local __M = {}
 __M["lib.parse"] = (function()
@@ -762,10 +762,21 @@ function M.targetConfirmed(at)
   return nil, nil
 end
 
--- The other player's user id.
+-- The other player's user id. Live activeTrade has no targetID field - it has
+-- `target`/`player` Player objects (target = the other party) - so fall back to
+-- reading .UserId off those.
 function M.partnerId(at)
   if type(at) ~= "table" then return nil end
-  return at.targetID or at.targetId or at.partnerID or at.otherID or at.otherId
+  local id = at.targetID or at.targetId or at.partnerID or at.otherID or at.otherId
+  if id then return id end
+  local function uid(p)
+    if type(p) == "userdata" or type(p) == "table" then
+      local ok, v = pcall(function() return p.UserId end)
+      if ok and v then return v end
+    end
+    return nil
+  end
+  return uid(at.target) or uid(at.player)
 end
 
 return M
@@ -1499,22 +1510,38 @@ function M:waitForTrade(timeout)
   return self:freshTrade()
 end
 
--- Accept + wait for the window. The deob showed BOTH accept forms (Player
--- object and uid); we try the Player first and retry once with the uid if no
--- window opens - the debug report then tells us which form the server honors.
+-- Accept + wait for the window. The exact accept-argument form the server
+-- honors is unconfirmed (Player object vs uid number vs uid string), so try
+-- each in turn and return as soon as a trade window appears.
 function M:acceptAndWait(invite)
   local d = self.d
-  local window = d.cfg.acceptTimeoutSec or 15
-  if invite.active then return self:waitForTrade(window) end
-  self:accept(invite)
-  local at = self:waitForTrade(window)
-  if not at and invite.uid and invite.player then
-    d.log("no trade window after Player-object accept - retrying with uid " .. tostring(invite.uid))
-    pcall(function() d.remotes.trading_acceptinvite:FireServer(tonumber(invite.uid) or invite.uid) end)
-    at = self:waitForTrade(window)
+  if invite.active then return self:waitForTrade(d.cfg.acceptTimeoutSec or 15) end
+  local cands = {}
+  if invite.player then cands[#cands + 1] = { "Player", invite.player } end
+  if invite.uid ~= nil then
+    cands[#cands + 1] = { "uid#", tonumber(invite.uid) or invite.uid }
+    cands[#cands + 1] = { "uid$", tostring(invite.uid) }
   end
-  if not at and d.dumpFullStatus then d.dumpFullStatus("full status after accept never showed a trade") end
-  return at
+  for _, c in ipairs(cands) do
+    d.log("accepting invite via " .. c[1])
+    pcall(function() d.remotes.trading_acceptinvite:FireServer(c[2]) end)
+    local at = self:waitForTrade(6)
+    if type(at) == "table" then return at end
+  end
+  if d.dumpFullStatus then d.dumpFullStatus("full status after accept never showed a trade") end
+  return nil
+end
+
+-- Is our item already sitting in the trade? (offeredItemsPlayer = OUR side,
+-- confirmed live.) Prevents re-adding the same item on a re-handled window.
+function M:itemAlreadyOffered(at, id)
+  local mine = type(at) == "table" and at.offeredItemsPlayer or nil
+  if type(mine) ~= "table" then return false end
+  for _, it in pairs(mine) do
+    local iid = (type(it) == "table" and (it.itemID or it.id or it.ID)) or it
+    if iid ~= nil and tostring(iid) == tostring(id) then return true end
+  end
+  return false
 end
 
 -- ---- SELL -------------------------------------------------------------------
@@ -1545,16 +1572,28 @@ function M:runSell(invite)
   -- cost basis for profit stats = item's market worth (fall back to the price)
   local marketVal = (feedEntry and tonumber(feedEntry.value)) or orderPrice or 0
 
-  if not self:addItem(setName) then return self:abort("could not add " .. setName) end
+  -- add our item once (don't pile it on if a re-handle left it in the window)
+  local itemId = d.catalog[setName].id
+  if self:itemAlreadyOffered(self:freshTrade() or at, itemId) then
+    d.log(setName .. " already offered in this trade - not re-adding")
+  elseif not self:addItem(setName) then
+    return self:abort("could not add " .. setName)
+  end
   if d.sendTradeMsg then
     d.sendTradeMsg(("Selling %s for %s gems - add gems and confirm!"):format(setName, tostring(quote.ask)))
   end
   d.log(("SELL %s | ask %s ceiling %s floor %s hardFloor %s | buyer has %s")
     :format(setName, tostring(quote.ask), tostring(quote.ceiling), tostring(quote.floor), tostring(hardFloor), tostring(self:buyerGems(at))))
 
+  -- Patient loop: wait (HOLD) for the buyer to add gems up to tradeTimeoutSec;
+  -- only abort early if they actively offer a positive amount that's too low.
+  -- `round` advances only on real haggling (chat counters), not passive waits.
   local start = os.time()
-  for round = 0, (d.cfg.negotiation.maxRounds or 3) do
-    local cur = self:freshTrade() or at
+  local round = 0
+  while true do
+    if os.time() - start > (d.cfg.tradeTimeoutSec or 60) then return self:abort("timeout waiting for buyer gems") end
+    local cur = self:freshTrade()
+    if type(cur) ~= "table" then return self:abort("trade window closed") end
     local bg = self:buyerGems(cur)
     local decision = negotiation.decide(d.cfg, quote, { offeredGems = bg, round = round, elapsed = os.time() - start })
     d.log(("round %d: buyer=%s decision=%s"):format(round, tostring(bg), decision.action))
@@ -1590,15 +1629,17 @@ function M:runSell(invite)
       return
     elseif decision.action == "COUNTER" then
       if d.sendTradeMsg then d.sendTradeMsg(decision.message) end
+      round = round + 1
       task.wait(d.cfg.negotiation.chatCooldownSec or 4)
     elseif decision.action == "ABORT" then
-      return self:abort("buyer offer too low")
+      -- buyer actively put in gems but too few -> give up; if they just haven't
+      -- added anything yet, keep waiting until the timeout above
+      if bg and bg > 0 then return self:abort(("buyer offer too low (%s)"):format(tostring(bg))) end
+      task.wait(2)
     else
       task.wait(2)
     end
-    if os.time() - start > (d.cfg.tradeTimeoutSec or 60) then return self:abort("timeout") end
   end
-  return self:abort("max rounds")
 end
 
 -- ---- BUY (gem-cap mode) -----------------------------------------------------
@@ -1686,30 +1727,35 @@ local M = {}
 -- (executor builtin; harmless passthrough where it isn't available).
 local function cref(o) return (cloneref and cloneref(o)) or o end
 
--- Legacy remote path (also the fallback if SendAsync is blocked for this executor).
+-- Legacy remote path (fallback only - on this game the remote EXISTS but is
+-- inert: FireServer succeeds yet nothing posts, which is why v1.9.1's
+-- ChatVersion-based routing looked "sent" but showed nothing).
 local function sayLegacy(text)
   return pcall(function()
-    cref(ReplicatedStorage).DefaultChatSystemChatEvents.SayMessageRequest:FireServer(text, "All")
+    local ev = cref(ReplicatedStorage):FindFirstChild("DefaultChatSystemChatEvents")
+    local req = ev and ev:FindFirstChild("SayMessageRequest")
+    if not req then error("no SayMessageRequest") end
+    req:FireServer(text, "All")
   end)
 end
 
--- Post to public chat. Detects legacy vs TextChatService the same way the
--- known-working community pattern does. Returns (ok, err, path) so callers can
--- log which path worked.
+-- Post to public chat. Route by which channel EXISTS (method calls are
+-- cloneref-safe) rather than reading .ChatVersion (that PROPERTY misreads off a
+-- clonereffed service - it reported Legacy on this modern game). My Restaurant
+-- is TextChatService (RBXGeneral confirmed present), so SendAsync is primary.
+-- Returns (ok, err, path) so callers can log which path actually sent.
 local function sendChat(text)
   text = tostring(text)
-  local tcs = cref(TextChatService)
-  local legacy = false
-  pcall(function() legacy = tcs.ChatVersion == Enum.ChatVersion.LegacyChatService end)
-  if not legacy then
-    local ok, err = pcall(function() tcs.TextChannels.RBXGeneral:SendAsync(text) end)
-    if ok then return true, nil, "SendAsync" end
-    local ok2, err2 = sayLegacy(text)
-    if ok2 then return true, nil, "SayMessageRequest(fallback)" end
-    return false, tostring(err) .. " / " .. tostring(err2), nil
-  end
-  local ok, err = sayLegacy(text)
-  return ok, err, ok and "SayMessageRequest" or nil
+  local ok, err = pcall(function()
+    local channels = cref(TextChatService):FindFirstChild("TextChannels")
+    local ch = channels and channels:FindFirstChild("RBXGeneral")
+    if not ch then error("no RBXGeneral channel") end
+    ch:SendAsync(text)
+  end)
+  if ok then return true, nil, "SendAsync" end
+  local okL, errL = sayLegacy(text)
+  if okL then return true, nil, "SayMessageRequest" end
+  return false, tostring(err) .. " / " .. tostring(errL), nil
 end
 M.sendChat = sendChat
 
@@ -1876,6 +1922,16 @@ function M.build(deps)
     end })
   Diag:Button({ Title = "Print Debug Report to Console", Icon = "terminal",
     Callback = function() if deps.debug and deps.debug.print then deps.debug.print() end end })
+  Diag:Button({ Title = "Send Test Chat Message", Icon = "message-square",
+    Callback = function()
+      if not (deps.debug and deps.debug.testChat) then return end
+      local ok, err, path = deps.debug.testChat()
+      pcall(function()
+        WindUI:Notify({ Title = "Auto-Trade",
+          Content = ok and ("Sent via " .. tostring(path) .. " - check chat.") or ("Failed: " .. tostring(err)),
+          Duration = 6 })
+      end)
+    end })
 
   -- ---- Main tab: enable + advertising. What/how-much/price live on Items. ----
   Main:Toggle({ Title = "Enable Universal Auto-Trade", Value = cfg.enabled,
@@ -1988,7 +2044,7 @@ end)()
 -- (workspace.__THINGS.__REMOTES + Framework.Library) and builds its own WindUI.
 local CONFIG = {
   feedUrl = "https://raw.githubusercontent.com/0xfray/Mr-script/refs/heads/main/MR/value.lua",
-  version = "v1.10-busyfix",
+  version = "v1.11-oneshot",
 }
 
 local libConfig  = __M["lib.config"]
@@ -2094,7 +2150,12 @@ local uiHandle = ui.build({ cfg = cfg, feed = feed, vendItems = vendItems,
   itemOptions = itemOptions, itemsAreOwned = itemsAreOwned,
   orders = ordersLib, shortFn = libAds.short, parse = parse,
   save = persist.saveSettings, stats = statsObj,
-  debug = { copy = copyReport, print = function() print(dbg:report("AutoTrade " .. CONFIG.version)) end },
+  debug = { copy = copyReport, print = function() print(dbg:report("AutoTrade " .. CONFIG.version)) end,
+    testChat = function()
+      local ok, err, path = advertiser.sendChat("[AutoTrade] chat test - please ignore")
+      logp(ok and ("chat test sent via " .. tostring(path)) or ("chat test FAILED: " .. tostring(err)))
+      return ok, err, path
+    end },
   onToggleEnabled = function() end })
 if uiHandle then logok("WindUI panel loaded") else logwarn("WindUI panel FAILED to load") end
 local function setStatus(t) if uiHandle and uiHandle.setStatus then uiHandle.setStatus(t) end end
@@ -2237,11 +2298,16 @@ if remotes and rroot then
     logp(("HANDLING invite from %s uid=%s"):format(name, tostring(uid)))
     task.spawn(function() runner:handle({ uid = uid, player = player, name = name }) end)
   end
-  local lastActiveDispatch = 0
+  -- Handle each OPEN trade window exactly once. Without this, an open trade the
+  -- buyer keeps alive (e.g. after we abort) gets re-dispatched every tick and
+  -- our item is re-added indefinitely - a giveaway risk. Cleared when the trade
+  -- closes (see processStatus), so a genuinely new trade (new UID) is handled.
+  local handledTradeUID
   local function tryHandleActiveTrade(at)
     if not cfg.enabled or runner.busy then return end
+    local tuid = type(at) == "table" and at.tradeUID or nil
+    if tuid and tuid == handledTradeUID then return end -- already handled this window
     if idle() then return end
-    if os.time() - lastActiveDispatch < 10 then return end -- throttle (esp. when uid is unknown)
     local uid = tradefields.partnerId(at)
     local player = uid and gamedata.playerFromUid(uid) or nil
     if uid then
@@ -2250,16 +2316,14 @@ if remotes and rroot then
         if reason == "blocked" then
           -- blocklisted partner holds a window open: decline it instead of
           -- deadlocking (processStatus skips invites while any trade is open).
-          -- Cooldown-gated partners are NOT aborted - that gate self-expires
-          -- and aborting could cancel a just-completed trade's countdown.
-          lastActiveDispatch = os.time()
+          handledTradeUID = tuid
           logp("declining active trade with BLOCKED partner uid=" .. tostring(uid))
           pcall(function() remotes.trading_abort:FireServer() end)
         end
         return
       end
     end
-    lastActiveDispatch = os.time()
+    handledTradeUID = tuid
     logp("HANDLING active trade" .. (player and (" with " .. player.Name) or "") .. " uid=" .. tostring(uid))
     task.spawn(function() runner:handle({ active = true, uid = uid, player = player, name = player and player.Name or nil }) end)
   end
@@ -2277,6 +2341,7 @@ if remotes and rroot then
       tryHandleActiveTrade(at)
       return
     end
+    handledTradeUID = nil -- no open trade -> next one (new UID) may be handled
     local inv = s.incomingInvites
     if type(inv) == "table" then
       for key, entry in pairs(inv) do
