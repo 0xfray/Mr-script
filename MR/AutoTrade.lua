@@ -1,4 +1,4 @@
--- Universal Auto-Trade v1.16-trademsg  |  bundled by tools/bundle.py - do not edit.
+-- Universal Auto-Trade v1.19-sets  |  bundled by tools/bundle.py - do not edit.
 -- Source of truth: src/*.lua  (regenerate: python tools/bundle.py)
 local __M = {}
 __M["lib.parse"] = (function()
@@ -30,13 +30,36 @@ return M
 
 end)()
 __M["lib.orders"] = (function()
--- Sell-order queue. Each order = { item, qty, price, sold }. The bot fills the
--- first active order (sold < qty) at its fixed price until done, then moves on.
+-- Sell-order queue. An order sells `qty` UNITS of a bundle for `price` each.
+-- A unit's bundle is `components` = { {item, per}, ... }:
+--   * single item  -> one component (per = 1); stored legacy-style as .item
+--   * set          -> several components + a .label (e.g. "Wave Set")
+-- Each trade packs as many whole units as fit under the per-trade item cap.
 -- Pure logic - no Roblox globals; TDD'd in tests/orders_test.lua.
 local M = {}
 
--- Upsert an order for `item`: replace qty+price, preserve progress (clamped).
--- Returns the order, or (nil, reason) on invalid input.
+-- Normalized components of an order.
+function M.components(o)
+  if type(o.components) == "table" and #o.components > 0 then return o.components end
+  if o.item then return { { item = o.item, per = 1 } } end
+  return {}
+end
+
+-- Items placed per unit sold (sum of per). A single item = 1.
+function M.itemsPerUnit(o)
+  local n = 0
+  for _, c in ipairs(M.components(o)) do n = n + (tonumber(c.per) or 1) end
+  return math.max(1, n)
+end
+
+-- Display name.
+function M.label(o)
+  return o.label or o.item or "?"
+end
+
+local function isSet(o) return type(o.components) == "table" and #o.components > 0 end
+
+-- Upsert a single-item order (back-compat with the pre-set API).
 function M.add(cfg, item, qty, price)
   if type(item) ~= "string" or item == "" then return nil, "no item" end
   qty = math.floor(tonumber(qty) or 0)
@@ -45,7 +68,7 @@ function M.add(cfg, item, qty, price)
   if price <= 0 then return nil, "price must be > 0" end
   cfg.orders = cfg.orders or {}
   for _, o in ipairs(cfg.orders) do
-    if o.item == item then
+    if not isSet(o) and o.item == item then
       o.qty, o.price = qty, price
       o.sold = math.min(o.sold or 0, qty)
       return o
@@ -56,38 +79,96 @@ function M.add(cfg, item, qty, price)
   return o
 end
 
-function M.remove(cfg, item)
+-- Upsert a set order. components = { {item, per}, ... } (per = pieces per set).
+-- qty = number of SETS to sell; price = gems per set.
+function M.addSet(cfg, label, components, qty, price)
+  if type(label) ~= "string" or label == "" then return nil, "no set name" end
+  if type(components) ~= "table" then return nil, "set has no pieces" end
+  qty = math.floor(tonumber(qty) or 0)
+  price = math.floor(tonumber(price) or 0)
+  if qty <= 0 then return nil, "quantity must be > 0" end
+  if price <= 0 then return nil, "price must be > 0" end
+  local comps = {}
+  for _, c in ipairs(components) do
+    local per = math.floor(tonumber(c.per or c.qty) or 0)
+    if type(c.item) == "string" and c.item ~= "" and per > 0 then
+      comps[#comps + 1] = { item = c.item, per = per }
+    end
+  end
+  if #comps == 0 then return nil, "set has no valid pieces" end
+  cfg.orders = cfg.orders or {}
+  for _, o in ipairs(cfg.orders) do
+    if isSet(o) and o.label == label then
+      o.components, o.qty, o.price = comps, qty, price
+      o.sold = math.min(o.sold or 0, qty)
+      return o
+    end
+  end
+  local o = { label = label, components = comps, qty = qty, price = price, sold = 0 }
+  table.insert(cfg.orders, o)
+  return o
+end
+
+-- Units (items or sets) to sell in ONE trade: the largest whole number that
+-- fits under `maxItems` (default 18), never more than remain, and - when an
+-- owned-count map is given - never more than we hold the pieces for.
+function M.unitsPerTrade(o, maxItems, owned)
+  maxItems = maxItems or 18
+  local remaining = (o.qty or 0) - (o.sold or 0)
+  if remaining <= 0 then return 0 end
+  local perUnit = M.itemsPerUnit(o)
+  local n = math.min(remaining, math.max(1, math.floor(maxItems / perUnit)))
+  if type(owned) == "table" then
+    for _, c in ipairs(M.components(o)) do
+      local have = tonumber(owned[c.item]) or 0
+      local canMake = math.floor(have / (c.per or 1))
+      if canMake < n then n = canMake end
+    end
+    if n < 0 then n = 0 end
+  end
+  return n
+end
+
+-- First order still needing units whose every component is sellable.
+function M.next(cfg, isSellable)
+  for _, o in ipairs((cfg and cfg.orders) or {}) do
+    if (o.sold or 0) < (o.qty or 0) then
+      local ok = true
+      if isSellable then
+        for _, c in ipairs(M.components(o)) do
+          if not isSellable(c.item) then ok = false; break end
+        end
+      end
+      if ok then return o end
+    end
+  end
+  return nil
+end
+
+-- Record `units` sold of order `o`. Returns (sold, qty, done).
+function M.recordSaleN(cfg, o, units)
+  o.sold = math.min((o.sold or 0) + (units or 1), o.qty or 0)
+  return o.sold, o.qty, (o.sold >= (o.qty or 0))
+end
+
+-- Back-compat: record ONE unit sold, found by label/item.
+function M.recordSale(cfg, item)
+  for _, o in ipairs((cfg and cfg.orders) or {}) do
+    if M.label(o) == item then return M.recordSaleN(cfg, o, 1) end
+  end
+  return nil
+end
+
+function M.remove(cfg, label)
   if type(cfg.orders) ~= "table" then return false end
   for i, o in ipairs(cfg.orders) do
-    if o.item == item then table.remove(cfg.orders, i); return true end
+    if M.label(o) == label then table.remove(cfg.orders, i); return true end
   end
   return false
 end
 
 function M.clear(cfg) cfg.orders = {} end
 
--- First order still needing units, optionally filtered by isSellable(item).
-function M.next(cfg, isSellable)
-  for _, o in ipairs((cfg and cfg.orders) or {}) do
-    if (o.sold or 0) < (o.qty or 0) and (not isSellable or isSellable(o.item)) then
-      return o
-    end
-  end
-  return nil
-end
-
--- Record one sold unit of `item`. Returns (sold, qty, done) or nil if unknown.
-function M.recordSale(cfg, item)
-  for _, o in ipairs((cfg and cfg.orders) or {}) do
-    if o.item == item then
-      o.sold = (o.sold or 0) + 1
-      return o.sold, o.qty, (o.sold >= (o.qty or 0))
-    end
-  end
-  return nil
-end
-
--- Total units still to sell across all orders.
 function M.remaining(cfg)
   local n = 0
   for _, o in ipairs((cfg and cfg.orders) or {}) do
@@ -96,8 +177,6 @@ function M.remaining(cfg)
   return n
 end
 
--- True only when there ARE orders and every one is filled (so "no orders" is
--- distinct from "all done" - the caller idles differently for each).
 function M.allDone(cfg)
   local any = false
   for _, o in ipairs((cfg and cfg.orders) or {}) do
@@ -107,12 +186,18 @@ function M.allDone(cfg)
   return any
 end
 
--- UI summary: { "Big Tip Jar  12/100 @ 750k", ... }. shortFn formats the price.
+-- UI summary: sets list their pieces.
 function M.summaryLines(cfg, shortFn)
   local out = {}
   for _, o in ipairs((cfg and cfg.orders) or {}) do
     local p = shortFn and shortFn(o.price or 0) or tostring(o.price or 0)
-    out[#out + 1] = ("%s  %d/%d @ %s"):format(o.item, o.sold or 0, o.qty or 0, p)
+    local line = ("%s  %d/%d @ %s"):format(M.label(o), o.sold or 0, o.qty or 0, p)
+    if isSet(o) then
+      local parts = {}
+      for _, c in ipairs(o.components) do parts[#parts + 1] = ("%s x%d"):format(c.item, c.per) end
+      line = line .. " [" .. table.concat(parts, ", ") .. "]"
+    end
+    out[#out + 1] = line
   end
   return out
 end
@@ -161,6 +246,7 @@ function M.defaults()
     -- its fixed price until qty is met, then stops. (See lib/orders.)
     orders = {},
     stopAtGemCap = true,      -- stop selling once gems reach gemCap
+    maxTradeItems = 18,       -- cap items added per trade (packs whole sets under this)
     minSellPct = 90,          -- hard floor: never confirm a sale below value * this%
     globalMarkupPct = 5,      -- ask = value * (1 + markup/100)
     bandPct = 10,             -- ceiling/floor = value * (1 +/- band/100)
@@ -1434,6 +1520,7 @@ local pricing = __M["lib.pricing"]
 local negotiation = __M["lib.negotiation"]
 local scamguard = __M["lib.scamguard"]
 local ads = __M["lib.ads"]
+local orders = __M["lib.orders"]
 local gamedata = __M["runtime.gamedata"]
 
 local M = {}
@@ -1550,11 +1637,12 @@ end
 -- our gem balance actually rises (so an abort/scam doesn't count as a sale). If
 -- the buyer drops gems below `required` after we confirm (the trade state
 -- change also un-confirms us), we bail; if our confirm gets reset, we re-fire.
-function M:confirmAndComplete(setName, fresh, required, marketVal)
+function M:confirmAndComplete(order, units, fresh, required)
   local d = self.d
+  local label = orders.label(order)
   local prevUID = (type(fresh) == "table") and fresh.tradeUID or nil
   local gemsBefore = d.getGems and d.getGems() or nil
-  d.log(("CONFIRMING sell of %s: buyer gems %s >= required %s"):format(setName, tostring(self:buyerGems(fresh)), tostring(required)))
+  d.log(("CONFIRMING %dx %s: buyer gems %s >= required %s"):format(units, label, tostring(self:buyerGems(fresh)), tostring(required)))
   self:fireTrade("Trading_ConfirmTrade", "trading_confirmtrade", fresh)
 
   local deadline = os.time() + (d.cfg.tradeTimeoutSec or 60)
@@ -1567,7 +1655,7 @@ function M:confirmAndComplete(setName, fresh, required, marketVal)
       task.wait(0.5)
       local gemsAfter = d.getGems and d.getGems() or nil
       if gemsBefore and gemsAfter and gemsAfter > gemsBefore then
-        if d.onSold then d.onSold(setName, 1, gemsAfter - gemsBefore, marketVal or 0) end
+        if d.onSold then d.onSold(order, units, gemsAfter - gemsBefore, required) end
       else
         d.log("trade window closed but gems did not increase - not recording (buyer aborted?)")
       end
@@ -1643,6 +1731,39 @@ function M:acceptAndWait(invite)
   return at
 end
 
+-- Does the trade's chatlog contain `text`? The trade chat display is driven by
+-- activeTrade.chatlog, so this proves whether our message actually landed
+-- server-side (i.e. the buyer sees it). nil = chatlog not readable.
+function M:chatlogHas(at, text)
+  local cl = type(at) == "table" and at.chatlog or nil
+  if type(cl) ~= "table" then return nil end
+  for _, e in pairs(cl) do
+    local m = (type(e) == "table" and (e.message or e.text or e.msg or e.content or e[1])) or e
+    if type(m) == "string" and text and m:find(text, 1, true) then return true end
+  end
+  return false
+end
+
+-- One-shot: 2s after sending, read the chatlog back and log whether our line is
+-- in it, plus the entry shape, so a debug report settles "did it send?".
+function M:verifyChatSent(needle)
+  if self.chatlogChecked then return end
+  self.chatlogChecked = true
+  local d = self.d
+  task.spawn(function()
+    task.wait(2)
+    local at = self:freshTrade()
+    local cl = type(at) == "table" and at.chatlog or nil
+    if type(cl) ~= "table" then d.log("chatlog check: not readable (" .. type(cl) .. ")"); return end
+    local n = 0; for _ in pairs(cl) do n = n + 1 end
+    d.log(("chatlog check: %d entries, our msg present = %s"):format(n, tostring(self:chatlogHas(at, needle))))
+    for _, e in pairs(cl) do
+      d.log("chatlog sample entry: " .. tostring((type(e) == "table" and (e.message or e.text or e[1] or "?")) or e))
+      break
+    end
+  end)
+end
+
 -- Is our item already sitting in the trade? Uses OUR side (role-aware).
 -- Prevents re-adding the same item on a re-handled window.
 function M:itemAlreadyOffered(at, id)
@@ -1661,94 +1782,124 @@ function M:runSell(invite)
   local d = self.d
   local at = self:acceptAndWait(invite)
   if not at then return self:abort("no active trade after accept") end
+  local openedAt = os.clock() -- trade just opened; price message goes out ~1s later
 
   local order = d.pickSellItem and d.pickSellItem(at)
   if not order then return self:abort("no active sell order (add one on the Items tab)") end
-  local setName = (type(order) == "table") and order.item or order
-  if not d.catalog[setName] then return self:abort("'" .. tostring(setName) .. "' has no game item id - pick another") end
+  local label = orders.label(order)
+  local comps = orders.components(order)
+  for _, c in ipairs(comps) do
+    if not d.catalog[c.item] then return self:abort("'" .. tostring(c.item) .. "' has no game item id - pick another") end
+  end
 
-  local feedEntry = d.feed[setName]
-  local orderPrice = (type(order) == "table") and tonumber(order.price) or nil
-  local quote, hardFloor
-  if orderPrice then
-    -- Fixed-price order: sell firmly at the user's price, never below it.
-    quote = { ask = orderPrice, ceiling = orderPrice, floor = orderPrice }
-    hardFloor = orderPrice
+  -- how many units (items / whole sets) to sell this trade: the most that fit
+  -- under the item cap, bounded by remaining and by how many we hold pieces for
+  local owned = d.ownedFn and d.ownedFn() or nil
+  local units = orders.unitsPerTrade(order, d.cfg.maxTradeItems or 18, owned)
+  if units < 1 then return self:abort("not enough stock to make a " .. label) end
+  local perUnit = tonumber(order.price) or 0
+  if perUnit <= 0 then return self:abort(label .. " has no price") end
+  local price = perUnit * units
+
+  -- add every piece (per x units), unless our side already has items (re-handle)
+  local mine = (self:info(self:freshTrade() or at) or {}).myItems
+  if type(mine) == "table" and next(mine) ~= nil then
+    d.log("our side already has items in this trade - not re-adding")
   else
-    local override = (d.cfg.items or {})[setName] or {}
-    quote = pricing.quote(d.cfg, feedEntry or {}, override, 1)
-    if not quote then return self:abort("unpriceable: " .. setName) end
-    local marketVal = feedEntry and tonumber(feedEntry.value)
-    hardFloor = marketVal and math.floor(marketVal * (d.cfg.minSellPct or 90) / 100) or quote.floor
+    local added, want = 0, 0
+    for _, c in ipairs(comps) do
+      for _ = 1, c.per * units do
+        want = want + 1
+        if self:addItem(c.item) then added = added + 1 end
+        task.wait(0.12) -- small gap so the server registers each add
+      end
+    end
+    d.log(("added %d/%d pieces for %dx %s"):format(added, want, units, label))
+    if added == 0 then return self:abort("could not add any pieces of " .. label) end
   end
-  -- cost basis for profit stats = item's market worth (fall back to the price)
-  local marketVal = (feedEntry and tonumber(feedEntry.value)) or orderPrice or 0
 
-  -- add our item once (don't pile it on if a re-handle left it in the window)
-  local itemId = d.catalog[setName].id
-  if self:itemAlreadyOffered(self:freshTrade() or at, itemId) then
-    d.log(setName .. " already offered in this trade - not re-adding")
-  elseif not self:addItem(setName) then
-    return self:abort("could not add " .. setName)
-  end
   -- the in-trade "how much" message (editable template)
+  local itemLabel = (units > 1) and (units .. "x " .. label) or label
   local template = (d.cfg.messages and d.cfg.messages.trade) or "Selling {item} for {price} gems - add gems and confirm!"
-  local tradeMsg = ads.render(template, { item = setName, price = ads.short(quote.ask), priceRaw = quote.ask })
+  local tradeMsg = ads.render(template, { item = itemLabel, price = ads.short(price), priceRaw = price,
+    qty = units, each = ads.short(perUnit) })
   local function sayPrice()
     if tradeMsg and d.sendTradeMsg then d.log("trade msg -> " .. tradeMsg); d.sendTradeMsg(tradeMsg) end
   end
+  -- send the price ~1s after the trade opened, so the buyer's window has loaded
+  local sinceOpen = os.clock() - openedAt
+  if sinceOpen < 1 then task.wait(1 - sinceOpen) end
   sayPrice()
-  d.log(("SELL %s | ask %s ceiling %s floor %s hardFloor %s | buyer has %s")
-    :format(setName, tostring(quote.ask), tostring(quote.ceiling), tostring(quote.floor), tostring(hardFloor), tostring(self:buyerGems(at))))
+  if tradeMsg then self:verifyChatSent(label) end
+  d.log(("SELL %dx %s | price %s | buyer has %s"):format(units, label, tostring(price), tostring(self:buyerGems(at))))
 
-  -- Patient loop: wait (HOLD) for the buyer to add gems up to tradeTimeoutSec;
-  -- only abort early if they actively offer a positive amount that's too low.
-  -- `round` advances only on real haggling (chat counters), not passive waits.
+  -- Fixed-price sell: no haggling. We offered up to `units` whole units; sell as
+  -- many as the buyer pays for (>= 1), removing the excess. Wait patiently for
+  -- gems up to tradeTimeoutSec.
   local start = os.time()
-  local round = 0
   local lastSay = os.time()
   while true do
     if os.time() - start > (d.cfg.tradeTimeoutSec or 60) then return self:abort("timeout waiting for buyer gems") end
     local cur = self:freshTrade()
     if type(cur) ~= "table" then return self:abort("trade window closed") end
     local bg = self:buyerGems(cur)
-    -- re-post the price every ~20s while the buyer hasn't paid enough, so a
-    -- late arrival still sees it
-    if bg < (quote.floor or 0) and (os.time() - lastSay) >= 20 then lastSay = os.time(); sayPrice() end
-    local decision = negotiation.decide(d.cfg, quote, { offeredGems = bg, round = round, elapsed = os.time() - start })
-    d.log(("round %d: buyer=%s decision=%s"):format(round, tostring(bg), decision.action))
+    if bg < perUnit and (os.time() - lastSay) >= 20 then lastSay = os.time(); sayPrice() end
 
-    if decision.action == "ACCEPT" then
-      local required = math.max(negotiation.threshold(d.cfg, quote, round), hardFloor)
+    local affordable = math.min(units, math.floor(bg / perUnit))
+    if affordable >= 1 then
       local fresh = self:freshTrade() or cur
-      local fg = self:buyerGems(fresh)
-      if not scamguard.safeToConfirmSell(required, fg) then
-        return self:abort(("safety: buyer %s < required %s (hardFloor %s)"):format(tostring(fg), tostring(required), tostring(hardFloor)))
+      affordable = math.min(units, math.floor(self:buyerGems(fresh) / perUnit))
+      if affordable < 1 then task.wait(1) -- gems slipped; keep waiting
+      else
+        if affordable < units then
+          d.log(("buyer paid for %d of %d %s - removing the extra"):format(affordable, units, label))
+          self:removeExcess(order, fresh, affordable)
+          task.wait(0.4); fresh = self:freshTrade() or fresh
+        end
+        local required = perUnit * affordable
+        local fg = self:buyerGems(fresh)
+        if not scamguard.safeToConfirmSell(required, fg) then task.wait(1)
+        else
+          if d.cfg.requireBuyerConfirm then
+            local okc, why = self:waitTargetConfirm(required)
+            if not okc then return self:abort(why) end
+          end
+          if d.cfg.testMode then
+            d.log(("TEST MODE: WOULD CONFIRM %dx %s - buyer gems %s >= %s (not confirming)")
+              :format(affordable, label, tostring(fg), tostring(required)))
+            task.wait(1)
+            return self:abort("test mode (no confirm)")
+          end
+          return self:confirmAndComplete(order, affordable, fresh, required)
+        end
       end
-      -- optional extra safety: wait for the buyer to press confirm first. OFF by
-      -- default (it deadlocks when the buyer is waiting on US).
-      if d.cfg.requireBuyerConfirm then
-        local okc, why = self:waitTargetConfirm(required)
-        if not okc then return self:abort(why) end
-      end
-      if d.cfg.testMode then
-        d.log(("TEST MODE: WOULD CONFIRM sell of %s - buyer gems %s >= required %s (not confirming)")
-          :format(setName, tostring(fg), tostring(required)))
-        task.wait(1)
-        return self:abort("test mode (no confirm)")
-      end
-      return self:confirmAndComplete(setName, fresh, required, marketVal)
-    elseif decision.action == "COUNTER" then
-      if d.sendTradeMsg then d.sendTradeMsg(decision.message) end
-      round = round + 1
-      task.wait(d.cfg.negotiation.chatCooldownSec or 4)
-    elseif decision.action == "ABORT" then
-      -- buyer actively put in gems but too few -> give up; if they just haven't
-      -- added anything yet, keep waiting until the timeout above
-      if bg and bg > 0 then return self:abort(("buyer offer too low (%s)"):format(tostring(bg))) end
-      task.wait(2)
     else
-      task.wait(2)
+      task.wait(1.5)
+    end
+  end
+end
+
+-- Remove offered pieces so exactly `keep` whole units remain. Uses the item
+-- UIDs the server assigned (read from our offered-items side) and
+-- trading_removeitem(UID).
+function M:removeExcess(order, at, keep)
+  local ti = self:info(at)
+  local mine = ti and ti.myItems or nil
+  if type(mine) ~= "table" then return end
+  local byId = {}
+  for _, it in pairs(mine) do
+    if type(it) == "table" then
+      local id = tostring(it.itemID or it.id or it.ID)
+      local uid = it.UID or it.uid
+      if id and uid then byId[id] = byId[id] or {}; table.insert(byId[id], uid) end
+    end
+  end
+  for _, c in ipairs(orders.components(order)) do
+    local id = tostring(self.d.catalog[c.item].id)
+    local uids = byId[id] or {}
+    for i = (keep * c.per) + 1, #uids do
+      self:fireTrade("Trading_RemoveItem", "trading_removeitem", uids[i])
+      task.wait(0.1)
     end
   end
 end
@@ -1834,6 +1985,7 @@ local Players = game:GetService("Players")
 local TextChatService = game:GetService("TextChatService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ads = __M["lib.ads"]
+local orders = __M["lib.orders"]
 local M = {}
 
 -- cloneref hides our reference to the service from the game's anti-cheat hooks
@@ -1872,15 +2024,20 @@ local function sendChat(text)
 end
 M.sendChat = sendChat
 
--- Advertise the active sell orders at their fixed prices (skip filled orders,
--- and out-of-stock ones when inventory is known).
+-- Advertise the active sell orders (items or sets) at their prices. Skips
+-- filled orders, and out-of-stock ones when inventory is known (a set needs all
+-- its pieces in stock).
 local function buildListings(cfg, feed, owned)
   local listings = {}
   for _, o in ipairs(cfg.orders or {}) do
     if (o.sold or 0) < (o.qty or 0) then
-      if (not owned) or (owned[o.item] and owned[o.item] > 0) then
-        listings[#listings + 1] = { name = o.item, ask = tonumber(o.price) or 0 }
+      local inStock = true
+      if owned then
+        for _, c in ipairs(orders.components(o)) do
+          if not (owned[c.item] and owned[c.item] >= (c.per or 1)) then inStock = false; break end
+        end
       end
+      if inStock then listings[#listings + 1] = { name = orders.label(o), ask = tonumber(o.price) or 0 } end
     end
   end
   return listings
@@ -2081,41 +2238,77 @@ function M.build(deps)
   local orders  = deps.orders
   local shortFn = deps.shortFn or tostring
   local parse   = deps.parse
-
-  Items:Paragraph({ Title = "Add a sell order",
-    Desc = deps.itemsAreOwned and "Items you own that can be traded."
-      or "Showing all sellable items (couldn't read your inventory yet - it'll narrow to what you own once that's mapped)." })
+  local function toGems(txt) return (parse and parse.gems(txt)) or tonumber(txt) end
+  local function digits(txt) return math.floor(tonumber((txt:gsub("[^%d]", ""))) or 0) end
+  local function notify(txt) pcall(function() WindUI:Notify({ Title = "Auto-Trade", Content = txt, Duration = 5 }) end) end
 
   local opts = {}
   for _, n in ipairs(deps.itemOptions or {}) do opts[#opts + 1] = n end
   if #opts == 0 then opts = { "(no items)" } end
-  local selItem, selQty, selPrice = opts[1], 1, nil
 
-  Items:Dropdown({ Title = "Item", Values = opts, Value = opts[1],
-    Callback = function(sel) selItem = sel end })
-  Items:Input({ Title = "Quantity (e.g. 100)",
-    Callback = function(txt) selQty = math.floor(tonumber((txt:gsub("[^%d]", ""))) or 0) end })
-  Items:Input({ Title = "Price each (e.g. 750k)",
-    Callback = function(txt) selPrice = parse and parse.gems(txt) or tonumber(txt) end })
-
-  local ordersPara = Items:Paragraph({ Title = "Current orders", Desc = "(none)" })
+  local ordersPara
   local function refreshOrders()
     local lines = orders.summaryLines(cfg, shortFn)
     pcall(function() ordersPara:SetDesc(#lines > 0 and table.concat(lines, "\n") or "(none)") end)
   end
-  refreshOrders()
 
-  local function notify(txt) pcall(function() WindUI:Notify({ Title = "Auto-Trade", Content = txt, Duration = 5 }) end) end
-  Items:Button({ Title = "Add / Update Order", Icon = "plus",
+  Items:Paragraph({ Title = "Your items",
+    Desc = deps.itemsAreOwned and "Items you own." or "All game items (couldn't read your inventory yet)." })
+
+  -- ---- single-item order ----
+  local selItem, selQty, selPrice = opts[1], 1, nil
+  Items:Dropdown({ Title = "Item", Values = opts, Value = opts[1], Callback = function(s) selItem = s end })
+  Items:Input({ Title = "Quantity (e.g. 100)", Callback = function(t) selQty = digits(t) end })
+  Items:Input({ Title = "Price each (e.g. 750k)", Callback = function(t) selPrice = toGems(t) end })
+  Items:Button({ Title = "Add single-item order", Icon = "plus",
     Callback = function()
       local o, err = orders.add(cfg, selItem, selQty, selPrice)
-      if o then save(cfg); refreshOrders()
-        notify(("Selling %d x %s @ %s each"):format(o.qty, o.item, shortFn(o.price)))
-      else notify("Couldn't add order: " .. tostring(err)) end
+      if o then save(cfg); refreshOrders(); notify(("Selling %d x %s @ %s"):format(o.qty, selItem, shortFn(o.price)))
+      else notify("Couldn't add: " .. tostring(err)) end
     end })
-  Items:Button({ Title = "Remove Selected Item's Order", Icon = "trash",
-    Callback = function() if orders.remove(cfg, selItem) then save(cfg); refreshOrders() end end })
-  Items:Button({ Title = "Clear All Orders", Icon = "trash-2",
+
+  -- ---- set builder ----
+  Items:Paragraph({ Title = "Build a set",
+    Desc = "Add each piece (item + how many per set), then name + price it. Sold as a bundle; each trade packs as many whole sets as fit the 18-item limit." })
+  local building = {}
+  local buildPara
+  local function refreshBuild()
+    local parts = {}
+    for _, c in ipairs(building) do parts[#parts + 1] = ("%s x%d"):format(c.item, c.per) end
+    pcall(function() buildPara:SetDesc(#parts > 0 and table.concat(parts, ", ") or "(no pieces yet)") end)
+  end
+  local pieceItem, pieceQty = opts[1], 1
+  Items:Dropdown({ Title = "Piece", Values = opts, Value = opts[1], Callback = function(s) pieceItem = s end })
+  Items:Input({ Title = "How many per set", Callback = function(t) pieceQty = digits(t) end })
+  buildPara = Items:Paragraph({ Title = "Set so far", Desc = "(no pieces yet)" })
+  Items:Button({ Title = "Add piece to set", Icon = "plus",
+    Callback = function()
+      if not pieceItem or pieceQty < 1 then return end
+      local merged = false
+      for _, c in ipairs(building) do if c.item == pieceItem then c.per = pieceQty; merged = true end end
+      if not merged then building[#building + 1] = { item = pieceItem, per = pieceQty } end
+      refreshBuild()
+    end })
+  local setName, setQty, setPrice = "", 1, nil
+  Items:Input({ Title = "Set name (e.g. Wave Set)", Callback = function(t) setName = t end })
+  Items:Input({ Title = "How many sets to sell", Callback = function(t) setQty = digits(t) end })
+  Items:Input({ Title = "Price per set (e.g. 7.5k)", Callback = function(t) setPrice = toGems(t) end })
+  Items:Button({ Title = "Save set as order", Icon = "package",
+    Callback = function()
+      local o, err = orders.addSet(cfg, setName, building, setQty, setPrice)
+      if o then save(cfg); refreshOrders(); building = {}; refreshBuild()
+        notify(("Set '%s' saved: %d sets @ %s"):format(o.label, o.qty, shortFn(o.price)))
+      else notify("Couldn't save set: " .. tostring(err)) end
+    end })
+  Items:Button({ Title = "Clear set builder", Icon = "eraser",
+    Callback = function() building = {}; refreshBuild() end })
+
+  -- ---- current orders + management ----
+  ordersPara = Items:Paragraph({ Title = "Current orders", Desc = "(none)" })
+  refreshOrders()
+  Items:Input({ Title = "Remove order by name",
+    Callback = function(t) if t and t ~= "" and orders.remove(cfg, t) then save(cfg); refreshOrders() end end })
+  Items:Button({ Title = "Clear all orders", Icon = "trash-2",
     Callback = function() orders.clear(cfg); save(cfg); refreshOrders() end })
 
   -- ---- Safety / 24-7 tab ----
@@ -2174,7 +2367,7 @@ end)()
 -- (workspace.__THINGS.__REMOTES + Framework.Library) and builds its own WindUI.
 local CONFIG = {
   feedUrl = "https://raw.githubusercontent.com/0xfray/Mr-script/refs/heads/main/MR/value.lua",
-  version = "v1.16-trademsg",
+  version = "v1.19-sets",
 }
 
 local libConfig  = __M["lib.config"]
@@ -2260,19 +2453,21 @@ else
   table.sort(vendItems)
 end
 
--- ---- item options for the order builder: your OWNED tradeable items if the
--- inventory can be read, otherwise every sellable item (labeled) ---------------
-local itemOptions, itemsAreOwned = vendItems, false
+-- ---- item options for building orders/sets: your OWNED items if the inventory
+-- can be read, else EVERY game item (catalog). Set pieces don't need a feed
+-- value, so we no longer restrict to the value list. ---------------------------
+local allItems = {}
+if catalog then for name in pairs(catalog) do allItems[#allItems + 1] = name end end
+table.sort(allItems)
+local itemOptions, itemsAreOwned = (#allItems > 0 and allItems) or vendItems, false
 do
   local ownedMap = catalog and inventory.owned(rroot, catalog) or nil
   if type(ownedMap) == "table" and next(ownedMap) then
     local owned = {}
-    for name in pairs(ownedMap) do
-      if feed[name] and feed[name].value and catalog[name] then owned[#owned + 1] = name end
-    end
+    for name in pairs(ownedMap) do if catalog[name] then owned[#owned + 1] = name end end
     if #owned > 0 then table.sort(owned); itemOptions, itemsAreOwned = owned, true end
   end
-  logok(("item options: %d (%s)"):format(#itemOptions, itemsAreOwned and "your inventory" or "all sellable - inventory unreadable"))
+  logok(("item options: %d (%s)"):format(#itemOptions, itemsAreOwned and "your inventory" or "all game items"))
 end
 
 -- ---- build UI (now that we know what's sellable) -----------------------------
@@ -2363,8 +2558,10 @@ if remotes and rroot then
     return s
   end
 
-  local function isSellable(name) return (name and catalog[name] and feed[name] and feed[name].value) and true or false end
-  -- Returns the current sell ORDER (item + fixed price) to work, or nil.
+  -- Sellable = the game has the item (in the catalog). Orders carry their own
+  -- price, so a feed value is NOT required (set pieces often have none).
+  local function isSellable(name) return (name and catalog[name]) and true or false end
+  -- Returns the current sell ORDER (item or set + price) to work, or nil.
   local function pickSellItem(_at) return ordersLib.next(cfg, isSellable) end
   local function pickBuyItem(at)
     local offered = at and at.offeredItemsTarget
@@ -2378,15 +2575,16 @@ if remotes and rroot then
     if m == "buy" and lastMode ~= "buy" then onEvent("cap", { gems = gems }); logp("gem cap -> buy mode") end
     lastMode = m; return m
   end
-  local function onSold(item, qty, gems, cost)
+  local function onSold(order, units, gems, cost)
     libStats.recordSell(statsObj, gems, cost)
-    local sold, oqty, done = ordersLib.recordSale(cfg, item)
+    local label = ordersLib.label(order)
+    local sold, oqty, done = ordersLib.recordSaleN(cfg, order, units)
     persist.saveStats(statsObj); persist.saveSettings(cfg)
-    onEvent("sale", { item = item, qty = qty, gems = gems, profit = gems - cost })
+    onEvent("sale", { item = label, qty = units, gems = gems, profit = gems - cost })
     local prog = sold and (" [%d/%s]"):format(sold, tostring(oqty)) or ""
-    logp(("SOLD %s for %s%s"):format(item, tostring(gems), prog))
-    setStatus(("Sold %s for %s%s"):format(item, tostring(gems), prog))
-    if done then logp(("ORDER COMPLETE: %s %d/%d"):format(item, sold, oqty)) end
+    logp(("SOLD %dx %s for %s%s"):format(units, label, tostring(gems), prog))
+    setStatus(("Sold %dx %s for %s%s"):format(units, label, tostring(gems), prog))
+    if done then logp(("ORDER COMPLETE: %s %d/%d"):format(label, sold or 0, oqty or 0)) end
     if ordersLib.allDone(cfg) then logp("All sell orders complete - idling."); setStatus("All sell orders complete.") end
   end
   local function onBought(item, qty, gems)
@@ -2397,6 +2595,7 @@ if remotes and rroot then
   local runner = TradeM.new({
     remotes = remotes, cfg = cfg, feed = feed, catalog = catalog, fire = fire,
     getActiveTrade = getActiveTrade, refreshStatus = refreshStatus, sendTradeMsg = sendTradeMsg, getGems = getGems,
+    ownedFn = function() return inventory.owned(rroot, catalog) end,
     myBusy = function() return gamedata.myBusy(latestStatus) end,
     dumpFullStatus = function(label) logDump(label, latestStatus or {}) end,
     pickSellItem = pickSellItem, pickBuyItem = pickBuyItem,
