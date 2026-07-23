@@ -1,4 +1,4 @@
--- Universal Auto-Trade v1.12-spyfix  |  bundled by tools/bundle.py - do not edit.
+-- Universal Auto-Trade v1.13-netfire  |  bundled by tools/bundle.py - do not edit.
 -- Source of truth: src/*.lua  (regenerate: python tools/bundle.py)
 local __M = {}
 __M["lib.parse"] = (function()
@@ -1508,7 +1508,7 @@ end
 -- state you see. Returns true only when the trade demonstrably finished.
 function M:confirmTrade(fresh)
   local prevUID = (type(fresh) == "table") and fresh.tradeUID or nil
-  self.d.remotes.trading_confirmtrade:FireServer(fresh)
+  self:fireTrade("Trading_ConfirmTrade", "trading_confirmtrade", fresh)
   return self:verifyCompletion(prevUID)
 end
 
@@ -1524,12 +1524,6 @@ function M:handle(invite)
   end)
   if not ok then self:abort("error: " .. tostring(err)) end
   self.busy = false
-end
-
-function M:accept(invite)
-  local who = (type(invite) == "table" and (invite.player or invite.uid)) or invite
-  self.d.remotes.trading_acceptinvite:FireServer(who)
-  self.d.log("accepted invite (" .. tostring((type(invite) == "table" and invite.name) or who) .. ")")
 end
 
 function M:waitForTrade(timeout)
@@ -1551,26 +1545,28 @@ function M:waitForTrade(timeout)
   return self:freshTrade()
 end
 
--- Accept + wait for the window. The exact accept-argument form the server
--- honors is unconfirmed (Player object vs uid number vs uid string), so try
--- each in turn and return as soon as a trade window appears.
+-- Fire a trade action via Network.Fire (game-exact) with a direct-remote
+-- fallback. Spy-confirmed the game routes everything through Network.Fire.
+function M:fireTrade(netName, remoteName, ...)
+  if self.d.fire then return self.d.fire(netName, remoteName, ...) end
+  local r = self.d.remotes[remoteName]
+  if r then pcall(r.FireServer, r, ...); return true end
+  return false
+end
+
+-- Accept + wait for the window. Spy-confirmed: the game accepts via
+-- Network.Fire("Trading_AcceptInvite", Player) - the Player OBJECT.
 function M:acceptAndWait(invite)
   local d = self.d
   if invite.active then return self:waitForTrade(d.cfg.acceptTimeoutSec or 15) end
-  local cands = {}
-  if invite.player then cands[#cands + 1] = { "Player", invite.player } end
-  if invite.uid ~= nil then
-    cands[#cands + 1] = { "uid#", tonumber(invite.uid) or invite.uid }
-    cands[#cands + 1] = { "uid$", tostring(invite.uid) }
-  end
-  for _, c in ipairs(cands) do
-    d.log("accepting invite via " .. c[1])
-    pcall(function() d.remotes.trading_acceptinvite:FireServer(c[2]) end)
-    local at = self:waitForTrade(6)
-    if type(at) == "table" then return at end
-  end
-  if d.dumpFullStatus then d.dumpFullStatus("full status after accept never showed a trade") end
-  return nil
+  local who = invite.player
+  if type(who) ~= "userdata" and invite.uid then who = gamedata.playerFromUid(invite.uid) end
+  if type(who) ~= "userdata" then d.log("no Player object to accept invite - skipping"); return nil end
+  d.log("accepting invite (Player) " .. tostring(invite.name or ""))
+  self:fireTrade("Trading_AcceptInvite", "trading_acceptinvite", who)
+  local at = self:waitForTrade(d.cfg.acceptTimeoutSec or 15)
+  if not at and d.dumpFullStatus then d.dumpFullStatus("full status after accept never showed a trade") end
+  return at
 end
 
 -- Is our item already sitting in the trade? Uses OUR side (role-aware).
@@ -1747,13 +1743,13 @@ function M:addItem(setName)
   -- Spy-confirmed: the descriptor is passed DIRECTLY (not array-wrapped) -
   -- trading_additem:FireServer({itemID="4", className="Appliance"}).
   local descriptor = { itemID = tostring(c.id), className = c.className or setName }
-  self.d.remotes.trading_additem:FireServer(descriptor)
+  self:fireTrade("Trading_AddItem", "trading_additem", descriptor)
   self.d.log(("added %s (id %s class %s)"):format(setName, tostring(c.id), tostring(c.className)))
   return true
 end
 
 function M:abort(reason)
-  pcall(function() self.d.remotes.trading_abort:FireServer() end)
+  self:fireTrade("Trading_Abort", "trading_abort")
   self.d.log("Aborted: " .. reason)
 end
 
@@ -1868,7 +1864,7 @@ function M.start(deps)
     while true do
       task.wait(15)
       if cfg.enabled and cfg.ads.autoInvite
-        and deps.remotes and deps.remotes.trading_sendinvite
+        and (deps.fire or (deps.remotes and deps.remotes.trading_sendinvite))
         and not (deps.isBusy and deps.isBusy())
         and not (deps.hasActiveTrade and deps.hasActiveTrade()) then
         pcall(function()
@@ -1885,7 +1881,8 @@ function M.start(deps)
             if plr ~= Players.LocalPlayer and not isBlocklisted(plr) and not busy then
               local last = lastInvited[plr.UserId]
               if not last or (now - last) >= window then
-                deps.remotes.trading_sendinvite:FireServer(plr)
+                if deps.fire then deps.fire("Trading_SendInvite", "trading_sendinvite", plr)
+                else deps.remotes.trading_sendinvite:FireServer(plr) end
                 lastInvited[plr.UserId] = now
                 sent = sent + 1
                 deps.log("invited " .. plr.Name)
@@ -2088,7 +2085,7 @@ end)()
 -- (workspace.__THINGS.__REMOTES + Framework.Library) and builds its own WindUI.
 local CONFIG = {
   feedUrl = "https://raw.githubusercontent.com/0xfray/Mr-script/refs/heads/main/MR/value.lua",
-  version = "v1.12-spyfix",
+  version = "v1.13-netfire",
 }
 
 local libConfig  = __M["lib.config"]
@@ -2229,7 +2226,30 @@ if remotes and rroot then
     return at
   end
   local function getGems() return gamedata.gems() end
-  local function sendTradeMsg(text) pcall(function() remotes.trading_sendmessage:FireServer(text) end) end
+
+  -- Fire a trade action the way the GAME does: Library.Network.Fire("Trading_X",
+  -- ...) - the remote-spy showed the game routes EVERY trade action through this
+  -- (never a direct remote FireServer), so our direct calls may not fully take.
+  -- Falls back to the __REMOTES remote if the Network layer is unavailable.
+  local firedVia
+  local function fire(netName, remoteName, ...)
+    local net = rroot and rroot.Network
+    if net and type(net.Fire) == "function" then
+      local ok = pcall(net.Fire, netName, ...)
+      if ok then
+        if firedVia ~= "Network.Fire" then firedVia = "Network.Fire"; logok("trade actions via Network.Fire") end
+        return true
+      end
+    end
+    local r = remotes[remoteName]
+    if r then
+      pcall(r.FireServer, r, ...)
+      if firedVia ~= "remote" then firedVia = "remote"; logwarn("trade actions via direct remote (no Network.Fire)") end
+      return true
+    end
+    return false
+  end
+  local function sendTradeMsg(text) fire("Trading_SendMessage", "trading_sendmessage", text) end
 
   -- Live status poll: Library.Network.Invoke("Trading_GetStatus") - the game's
   -- ONLY status source (there are no status remotes/events). Tracks health so
@@ -2286,7 +2306,7 @@ if remotes and rroot then
   end
 
   local runner = TradeM.new({
-    remotes = remotes, cfg = cfg, feed = feed, catalog = catalog,
+    remotes = remotes, cfg = cfg, feed = feed, catalog = catalog, fire = fire,
     getActiveTrade = getActiveTrade, refreshStatus = refreshStatus, sendTradeMsg = sendTradeMsg,
     myBusy = function() return gamedata.myBusy(latestStatus) end,
     dumpFullStatus = function(label) logDump(label, latestStatus or {}) end,
@@ -2362,7 +2382,7 @@ if remotes and rroot then
           -- deadlocking (processStatus skips invites while any trade is open).
           handledTradeUID = tuid
           logp("declining active trade with BLOCKED partner uid=" .. tostring(uid))
-          pcall(function() remotes.trading_abort:FireServer() end)
+          fire("Trading_Abort", "trading_abort")
         end
         return
       end
@@ -2437,7 +2457,7 @@ if remotes and rroot then
 
   advertiser.start({ cfg = cfg, feed = feed, log = logp,
     ownedFn = function() return inventory.owned(rroot, catalog) end,
-    remotes = remotes,
+    remotes = remotes, fire = fire,
     isBusy = function() return runner.busy end,
     hasActiveTrade = function() return getActiveTrade() ~= nil end,
     isBusyPlayer = function(userId) return gamedata.isBusy(latestStatus, userId) end })
