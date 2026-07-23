@@ -1,4 +1,4 @@
--- Universal Auto-Trade v1.19-sets  |  bundled by tools/bundle.py - do not edit.
+-- Universal Auto-Trade v1.21-setfill  |  bundled by tools/bundle.py - do not edit.
 -- Source of truth: src/*.lua  (regenerate: python tools/bundle.py)
 local __M = {}
 __M["lib.parse"] = (function()
@@ -23,6 +23,35 @@ function M.gems(s)
     local n = tonumber((plain:gsub(",", "")))
     if n then return math.floor(n + 0.5) end
   end
+  return nil
+end
+
+-- How many sets/units a buyer is asking for in a chat line, or nil. Tuned to
+-- avoid false hits on price mentions like "is it 7.5k?".
+--   "2 sets"/"2 set" -> 2 ; "3x" -> 3 ; "two sets" -> 2 ; bare "2" -> 2 ;
+--   "gimme 3"/"want 2"/"buy 1" -> that number ; "how much?" -> nil
+local WORDS = { one = 1, two = 2, three = 3, four = 4, five = 5,
+                six = 6, seven = 7, eight = 8, nine = 9, ten = 10 }
+function M.setCount(s)
+  if type(s) ~= "string" then return nil end
+  s = s:lower()
+  local function ok(v) v = tonumber(v); if v and v >= 1 and v <= 99 then return v end return nil end
+  -- strongest: "N set(s)" or "Nx"
+  local n = s:match("(%d+)%s*sets?%f[%A]") or s:match("(%d+)%s*x%f[%A]")
+  if n then return ok(n) end
+  for w, v in pairs(WORDS) do
+    if s:match("%f[%a]" .. w .. "%f[%A]%s*sets?%f[%A]") then return v end
+  end
+  -- request verbs + a number: "gimme 3", "i want 2", "buy 1", "need 2"
+  if s:match("want") or s:match("gimme") or s:match("buy") or s:match("need")
+    or s:match("give") or s:match("get") or s:match("take") then
+    n = s:match("(%d+)")
+    if n then return ok(n) end
+  end
+  -- the whole message is just a number (or number + "set")
+  n = s:match("^%s*(%d+)%s*$") or s:match("^%s*(%d+)%s*sets?%s*$")
+  if n then return ok(n) end
+  for w, v in pairs(WORDS) do if s:match("^%s*" .. w .. "%s*sets?%s*$") then return v end end
   return nil
 end
 
@@ -288,6 +317,7 @@ function M.defaults()
     confirmVerifyTimeoutSec = 10, -- wait this long for the trade to clear after confirm
     inviteCooldownSec = 120,     -- min seconds between auto-invites to the same player
     acceptTimeoutSec = 15,       -- give up on an accepted invite if no trade window opens
+    gemSettleSec = 4,            -- confirm once the buyer's gems are unchanged this long
 
     -- Housekeeping
     feedRefreshSec = 1800,    -- re-fetch the value feed every 30 min (0 = never)
@@ -1172,6 +1202,7 @@ function M.tradeInfo(at)
     theirItems = at["offeredItems" .. tc],
     iConfirmed = at[mySide .. "Confirmed"],
     theirConfirmed = at[their .. "Confirmed"],
+    buyerUid = uidOf(at[their]),
     tradeUID = at.tradeUID,
   }
 end
@@ -1521,6 +1552,7 @@ local negotiation = __M["lib.negotiation"]
 local scamguard = __M["lib.scamguard"]
 local ads = __M["lib.ads"]
 local orders = __M["lib.orders"]
+local parse = __M["lib.parse"]
 local gamedata = __M["runtime.gamedata"]
 
 local M = {}
@@ -1764,6 +1796,39 @@ function M:verifyChatSent(needle)
   end)
 end
 
+-- How many sets the BUYER most recently asked for in trade chat, or nil.
+-- Reads activeTrade.chatlog, keeps only the buyer's own lines (matched by
+-- buyerUid), and parses the latest. Logs the chatlog entry shape once so we can
+-- confirm the sender/text field names from a debug report.
+function M:buyerChatRequest(at)
+  local cl = type(at) == "table" and at.chatlog or nil
+  if type(cl) ~= "table" then return nil end
+  local buyerUid = (self:info(at) or {}).buyerUid
+  local best, bestT
+  for _, e in pairs(cl) do
+    if type(e) == "table" then
+      if not self.loggedChatShape then
+        self.loggedChatShape = true
+        local keys = {}
+        for k in pairs(e) do keys[#keys + 1] = tostring(k) end
+        self.d.log("chatlog entry keys: " .. table.concat(keys, ","))
+      end
+      local text = e.message or e.text or e.msg or e.content or e[1]
+      local sender = e.sender or e.senderID or e.senderId or e.playerID or e.userId
+        or e.userID or e.from or e.player
+      local t = tonumber(e.timestamp or e.time or e.t) or 0
+      -- accept the buyer's lines; if we can't identify the sender at all, we
+      -- can't safely tell our own messages apart, so skip (avoid our numbers)
+      local fromBuyer = buyerUid ~= nil and sender ~= nil and tostring(sender) == tostring(buyerUid)
+      if type(text) == "string" and fromBuyer and (not bestT or t >= bestT) then
+        best, bestT = text, t
+      end
+    end
+  end
+  if best then return parse.setCount(best) end
+  return nil
+end
+
 -- Is our item already sitting in the trade? Uses OUR side (role-aware).
 -- Prevents re-adding the same item on a re-handled window.
 function M:itemAlreadyOffered(at, id)
@@ -1792,91 +1857,125 @@ function M:runSell(invite)
     if not d.catalog[c.item] then return self:abort("'" .. tostring(c.item) .. "' has no game item id - pick another") end
   end
 
-  -- how many units (items / whole sets) to sell this trade: the most that fit
-  -- under the item cap, bounded by remaining and by how many we hold pieces for
+  -- the most units (items / whole sets) we could sell this trade: fits the item
+  -- cap, bounded by remaining and by how many we hold pieces for
   local owned = d.ownedFn and d.ownedFn() or nil
-  local units = orders.unitsPerTrade(order, d.cfg.maxTradeItems or 18, owned)
-  if units < 1 then return self:abort("not enough stock to make a " .. label) end
+  local maxUnits = orders.unitsPerTrade(order, d.cfg.maxTradeItems or 18, owned)
+  if maxUnits < 1 then return self:abort("not enough stock to make a " .. label) end
   local perUnit = tonumber(order.price) or 0
   if perUnit <= 0 then return self:abort(label .. " has no price") end
-  local price = perUnit * units
 
-  -- add every piece (per x units), unless our side already has items (re-handle)
+  -- `offered` = whole units currently added to the trade. Adjust up/down,
+  -- VERIFYING each piece actually attached (adds fired too fast get dropped by
+  -- the server) and retrying any shortfall so the FULL set is always present.
+  local offered = 0
+  local function setOffered(n)
+    n = math.max(0, math.min(n, maxUnits))
+    if n < offered then
+      self:removeExcess(order, self:freshTrade() or at, n); task.wait(0.4)
+      offered = n; d.log(("offering %dx %s"):format(offered, label)); return
+    end
+    if n == offered and offered > 0 then return end
+    for attempt = 1, 5 do
+      local counts = self:offeredCounts(self:freshTrade() or at)
+      local shortfall = false
+      for _, c in ipairs(comps) do
+        local id = tostring(d.catalog[c.item].id)
+        local want = n * c.per
+        for _ = (counts[id] or 0) + 1, want do
+          self:addItem(c.item); task.wait(0.35); shortfall = true
+        end
+      end
+      if not shortfall then break end
+      task.wait(0.5) -- let the server register the adds before re-counting
+    end
+    local final = self:offeredCounts(self:freshTrade() or at)
+    for _, c in ipairs(comps) do
+      local got = final[tostring(d.catalog[c.item].id)] or 0
+      if got < n * c.per then d.log(("WARN: only %d/%d %s attached (own enough?)"):format(got, n * c.per, c.item)) end
+    end
+    offered = n
+    d.log(("offering %dx %s"):format(offered, label))
+  end
+
   local mine = (self:info(self:freshTrade() or at) or {}).myItems
   if type(mine) == "table" and next(mine) ~= nil then
+    offered = 1 -- a re-handle left items; the loop will adjust to demand
     d.log("our side already has items in this trade - not re-adding")
   else
-    local added, want = 0, 0
-    for _, c in ipairs(comps) do
-      for _ = 1, c.per * units do
-        want = want + 1
-        if self:addItem(c.item) then added = added + 1 end
-        task.wait(0.12) -- small gap so the server registers each add
-      end
-    end
-    d.log(("added %d/%d pieces for %dx %s"):format(added, want, units, label))
-    if added == 0 then return self:abort("could not add any pieces of " .. label) end
+    setOffered(1) -- baseline: one unit, so the buyer sees the item + per-unit price
   end
 
-  -- the in-trade "how much" message (editable template)
-  local itemLabel = (units > 1) and (units .. "x " .. label) or label
+  -- price message (editable template); {qty}/{each} let it show the count
   local template = (d.cfg.messages and d.cfg.messages.trade) or "Selling {item} for {price} gems - add gems and confirm!"
-  local tradeMsg = ads.render(template, { item = itemLabel, price = ads.short(price), priceRaw = price,
-    qty = units, each = ads.short(perUnit) })
-  local function sayPrice()
-    if tradeMsg and d.sendTradeMsg then d.log("trade msg -> " .. tradeMsg); d.sendTradeMsg(tradeMsg) end
+  local function say(n)
+    local shown = (n > 1) and (n .. "x " .. label) or label
+    local m = ads.render(template, { item = shown, price = ads.short(perUnit * n), priceRaw = perUnit * n,
+      qty = n, each = ads.short(perUnit), label = label })
+    if m and d.sendTradeMsg then d.log("trade msg -> " .. m); d.sendTradeMsg(m) end
   end
-  -- send the price ~1s after the trade opened, so the buyer's window has loaded
   local sinceOpen = os.clock() - openedAt
   if sinceOpen < 1 then task.wait(1 - sinceOpen) end
-  sayPrice()
-  if tradeMsg then self:verifyChatSent(label) end
-  d.log(("SELL %dx %s | price %s | buyer has %s"):format(units, label, tostring(price), tostring(self:buyerGems(at))))
+  say(offered)
+  self:verifyChatSent(label)
 
-  -- Fixed-price sell: no haggling. We offered up to `units` whole units; sell as
-  -- many as the buyer pays for (>= 1), removing the excess. Wait patiently for
-  -- gems up to tradeTimeoutSec.
+  -- Respond to the buyer: offer as many as they ask for (chat) or can afford,
+  -- and sell as many WHOLE units as they've paid for once they confirm or their
+  -- gems settle. Fixed price - no haggling.
   local start = os.time()
-  local lastSay = os.time()
+  local lastSay, lastChange, lastGems, chatN = os.time(), os.time(), -1, nil
   while true do
     if os.time() - start > (d.cfg.tradeTimeoutSec or 60) then return self:abort("timeout waiting for buyer gems") end
     local cur = self:freshTrade()
     if type(cur) ~= "table" then return self:abort("trade window closed") end
-    local bg = self:buyerGems(cur)
-    if bg < perUnit and (os.time() - lastSay) >= 20 then lastSay = os.time(); sayPrice() end
 
-    local affordable = math.min(units, math.floor(bg / perUnit))
-    if affordable >= 1 then
+    local req = self:buyerChatRequest(cur)
+    if req and req ~= chatN then chatN = req; d.log(("buyer asked for %d %s"):format(chatN, label)) end
+
+    local bg = self:buyerGems(cur)
+    if bg ~= lastGems then lastGems, lastChange = bg, os.time() end
+    local affordable = math.floor(bg / perUnit)
+
+    -- offer as many as requested or affordable (capped); re-say if it changed
+    local newOffer = math.min(math.max(chatN or 1, affordable, 1), maxUnits)
+    if newOffer ~= offered then setOffered(newOffer); say(offered)
+    elseif affordable < 1 and (os.time() - lastSay) >= 20 then lastSay = os.time(); say(offered) end
+
+    -- confirm once they've paid for >= 1 whole unit and are done (confirmed or
+    -- gems unchanged for a few seconds)
+    local settled = (os.time() - lastChange) >= (d.cfg.gemSettleSec or 4)
+    if math.min(offered, affordable) >= 1 and (self:targetConfirmed(cur) == true or settled) then
       local fresh = self:freshTrade() or cur
-      affordable = math.min(units, math.floor(self:buyerGems(fresh) / perUnit))
-      if affordable < 1 then task.wait(1) -- gems slipped; keep waiting
-      else
-        if affordable < units then
-          d.log(("buyer paid for %d of %d %s - removing the extra"):format(affordable, units, label))
-          self:removeExcess(order, fresh, affordable)
-          task.wait(0.4); fresh = self:freshTrade() or fresh
-        end
-        local required = perUnit * affordable
-        local fg = self:buyerGems(fresh)
-        if not scamguard.safeToConfirmSell(required, fg) then task.wait(1)
-        else
-          if d.cfg.requireBuyerConfirm then
-            local okc, why = self:waitTargetConfirm(required)
-            if not okc then return self:abort(why) end
-          end
+      local sellN = math.min(offered, math.floor(self:buyerGems(fresh) / perUnit))
+      if sellN >= 1 then
+        if sellN < offered then self:removeExcess(order, fresh, sellN); task.wait(0.3); fresh = self:freshTrade() or fresh end
+        local required, fg = perUnit * sellN, self:buyerGems(fresh)
+        if scamguard.safeToConfirmSell(required, fg) then
           if d.cfg.testMode then
-            d.log(("TEST MODE: WOULD CONFIRM %dx %s - buyer gems %s >= %s (not confirming)")
-              :format(affordable, label, tostring(fg), tostring(required)))
-            task.wait(1)
-            return self:abort("test mode (no confirm)")
+            d.log(("TEST MODE: WOULD CONFIRM %dx %s - buyer gems %s >= %s"):format(sellN, label, tostring(fg), tostring(required)))
+            task.wait(1); return self:abort("test mode (no confirm)")
           end
-          return self:confirmAndComplete(order, affordable, fresh, required)
+          return self:confirmAndComplete(order, sellN, fresh, required)
         end
       end
-    else
-      task.wait(1.5)
+    end
+    task.wait(1)
+  end
+end
+
+-- How many of each itemID we currently have offered (our side), so setOffered
+-- can verify the full set attached and retry any shortfall.
+function M:offeredCounts(at)
+  local ti = self:info(at)
+  local mine = ti and ti.myItems or nil
+  local counts = {}
+  if type(mine) == "table" then
+    for _, it in pairs(mine) do
+      local id = (type(it) == "table" and tostring(it.itemID or it.id or it.ID)) or nil
+      if id then counts[id] = (counts[id] or 0) + 1 end
     end
   end
+  return counts
 end
 
 -- Remove offered pieces so exactly `keep` whole units remain. Uses the item
@@ -2367,7 +2466,7 @@ end)()
 -- (workspace.__THINGS.__REMOTES + Framework.Library) and builds its own WindUI.
 local CONFIG = {
   feedUrl = "https://raw.githubusercontent.com/0xfray/Mr-script/refs/heads/main/MR/value.lua",
-  version = "v1.19-sets",
+  version = "v1.21-setfill",
 }
 
 local libConfig  = __M["lib.config"]
