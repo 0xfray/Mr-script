@@ -7,6 +7,7 @@ local WHITELIST_ENABLED = true
 local entries = {
     ["ca4169567d75af4344c01ec48172ce22f2f57a44363ddf9b07b5fbe0a687d00c21f8db56b3d5aa46c4006b8498687c37"] = 9999999999,
     ["92d23061dce80448f72c8fa5ae3176cf9a56825a6ae6b866642f69b56f6e3094"] = 9999999999,
+    ["a0199fdb2af3c31ecb1fda711f416e3ab1adde87a1bcc07a16b1fdad20a1b204"] = 9999999999,
 }
 -- ────────────────────────────────────────────────────────────────────
 
