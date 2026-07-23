@@ -1,4 +1,4 @@
--- Universal Auto-Trade v1.13-netfire  |  bundled by tools/bundle.py - do not edit.
+-- Universal Auto-Trade v1.14-confirm  |  bundled by tools/bundle.py - do not edit.
 -- Source of truth: src/*.lua  (regenerate: python tools/bundle.py)
 local __M = {}
 __M["lib.parse"] = (function()
@@ -190,7 +190,8 @@ function M.defaults()
     webhook = { url = "", onSale = true, onCap = true, onDisconnect = true, onError = true },
 
     -- Confirm gate + invites
-    requireBuyerConfirm = true,  -- only confirm once the buyer has confirmed
+    requireBuyerConfirm = false, -- if true, wait for the buyer to confirm before
+                                 -- we do (safer, but deadlocks if they wait on us)
     confirmVerifyTimeoutSec = 10, -- wait this long for the trade to clear after confirm
     inviteCooldownSec = 120,     -- min seconds between auto-invites to the same player
     acceptTimeoutSec = 15,       -- give up on an accepted invite if no trade window opens
@@ -1429,10 +1430,15 @@ function M:info(at)
   return ti
 end
 
--- Gems the buyer (the OTHER party) has put in.
+-- Gems the buyer (the OTHER party) has put in. When SELLING we add items, never
+-- gems, so our own offeredGems is 0 - which means the buyer's gems are simply
+-- the larger of the two offeredGems fields. That's robust even if we can't tell
+-- which side is us, so we use it whenever the role is uncertain.
 function M:buyerGems(at)
   local ti = self:info(at)
-  return ti and ti.buyerGems or 0
+  if not ti then return 0 end
+  if ti.sideKnown then return ti.buyerGems or 0 end
+  return math.max(ti.myGems or 0, ti.buyerGems or 0)
 end
 
 -- Whether the buyer has pressed confirm. nil = unknown (never confirm on it).
@@ -1510,6 +1516,47 @@ function M:confirmTrade(fresh)
   local prevUID = (type(fresh) == "table") and fresh.tradeUID or nil
   self:fireTrade("Trading_ConfirmTrade", "trading_confirmtrade", fresh)
   return self:verifyCompletion(prevUID)
+end
+
+-- Confirm the sale now (buyer gems already meet `required`), then wait for the
+-- buyer to also confirm and the countdown to finish. Records the sale only if
+-- our gem balance actually rises (so an abort/scam doesn't count as a sale). If
+-- the buyer drops gems below `required` after we confirm (the trade state
+-- change also un-confirms us), we bail; if our confirm gets reset, we re-fire.
+function M:confirmAndComplete(setName, fresh, required, marketVal)
+  local d = self.d
+  local prevUID = (type(fresh) == "table") and fresh.tradeUID or nil
+  local gemsBefore = d.getGems and d.getGems() or nil
+  d.log(("CONFIRMING sell of %s: buyer gems %s >= required %s"):format(setName, tostring(self:buyerGems(fresh)), tostring(required)))
+  self:fireTrade("Trading_ConfirmTrade", "trading_confirmtrade", fresh)
+
+  local deadline = os.time() + (d.cfg.tradeTimeoutSec or 60)
+  while os.time() <= deadline do
+    task.wait(0.5)
+    local s = d.refreshStatus and d.refreshStatus()
+    local at = s and gamedata.findActiveTrade(s) or nil
+    if type(at) ~= "table" or (prevUID and at.tradeUID and at.tradeUID ~= prevUID) then
+      -- trade window closed - completed OR aborted. Confirm via our gem balance.
+      task.wait(0.5)
+      local gemsAfter = d.getGems and d.getGems() or nil
+      if gemsBefore and gemsAfter and gemsAfter > gemsBefore then
+        if d.onSold then d.onSold(setName, 1, gemsAfter - gemsBefore, marketVal or 0) end
+      else
+        d.log("trade window closed but gems did not increase - not recording (buyer aborted?)")
+      end
+      return
+    end
+    local bg = self:buyerGems(at)
+    if bg < required then
+      return self:abort(("buyer reduced gems to %s after confirm - aborting"):format(tostring(bg)))
+    end
+    -- if a state change un-confirmed us but gems are still good, re-confirm
+    local ti = self:info(at)
+    if ti and ti.iConfirmed == false then
+      self:fireTrade("Trading_ConfirmTrade", "trading_confirmtrade", at)
+    end
+  end
+  return self:abort("confirmed but trade didn't complete (buyer never confirmed)")
 end
 
 function M:handle(invite)
@@ -1643,28 +1690,19 @@ function M:runSell(invite)
       if not scamguard.safeToConfirmSell(required, fg) then
         return self:abort(("safety: buyer %s < required %s (hardFloor %s)"):format(tostring(fg), tostring(required), tostring(hardFloor)))
       end
+      -- optional extra safety: wait for the buyer to press confirm first. OFF by
+      -- default (it deadlocks when the buyer is waiting on US).
       if d.cfg.requireBuyerConfirm then
         local okc, why = self:waitTargetConfirm(required)
         if not okc then return self:abort(why) end
       end
-      -- fresh read immediately before confirm (mirrors the game's own vendor)
-      fresh = self:freshTrade() or fresh
-      fg = self:buyerGems(fresh)
-      if not scamguard.safeToConfirmSell(required, fg) then
-        return self:abort(("safety: buyer dropped to %s < required %s at confirm"):format(tostring(fg), tostring(required)))
-      end
       if d.cfg.testMode then
-        d.log(("TEST MODE: WOULD SELL %s for %s gems (buyerConfirmed=%s) - not confirming"):format(
-          setName, tostring(fg), tostring(self:targetConfirmed(fresh))))
+        d.log(("TEST MODE: WOULD CONFIRM sell of %s - buyer gems %s >= required %s (not confirming)")
+          :format(setName, tostring(fg), tostring(required)))
         task.wait(1)
         return self:abort("test mode (no confirm)")
       end
-      if self:confirmTrade(fresh) then
-        if d.onSold then d.onSold(setName, 1, fg, marketVal or 0) end
-      else
-        d.log("confirm fired but trade did not complete in time - sale NOT recorded")
-      end
-      return
+      return self:confirmAndComplete(setName, fresh, required, marketVal)
     elseif decision.action == "COUNTER" then
       if d.sendTradeMsg then d.sendTradeMsg(decision.message) end
       round = round + 1
@@ -2040,7 +2078,7 @@ function M.build(deps)
     Callback = function(txt) cfg.buyDiscountPct = tonumber(txt) or cfg.buyDiscountPct; save(cfg) end })
   Safety:Input({ Title = "Player Cooldown sec (default 30)",
     Callback = function(txt) cfg.cooldownSec = tonumber(txt) or cfg.cooldownSec; save(cfg) end })
-  Safety:Toggle({ Title = "Require Buyer Confirm (recommended)", Value = cfg.requireBuyerConfirm ~= false,
+  Safety:Toggle({ Title = "Wait for Buyer Confirm first (may stall)", Value = cfg.requireBuyerConfirm == true,
     Callback = function(v) cfg.requireBuyerConfirm = v; save(cfg) end })
   Safety:Input({ Title = "Invite Cooldown sec (default 120)",
     Callback = function(txt) cfg.inviteCooldownSec = tonumber(txt) or cfg.inviteCooldownSec; save(cfg) end })
@@ -2085,7 +2123,7 @@ end)()
 -- (workspace.__THINGS.__REMOTES + Framework.Library) and builds its own WindUI.
 local CONFIG = {
   feedUrl = "https://raw.githubusercontent.com/0xfray/Mr-script/refs/heads/main/MR/value.lua",
-  version = "v1.13-netfire",
+  version = "v1.14-confirm",
 }
 
 local libConfig  = __M["lib.config"]
@@ -2307,7 +2345,7 @@ if remotes and rroot then
 
   local runner = TradeM.new({
     remotes = remotes, cfg = cfg, feed = feed, catalog = catalog, fire = fire,
-    getActiveTrade = getActiveTrade, refreshStatus = refreshStatus, sendTradeMsg = sendTradeMsg,
+    getActiveTrade = getActiveTrade, refreshStatus = refreshStatus, sendTradeMsg = sendTradeMsg, getGems = getGems,
     myBusy = function() return gamedata.myBusy(latestStatus) end,
     dumpFullStatus = function(label) logDump(label, latestStatus or {}) end,
     pickSellItem = pickSellItem, pickBuyItem = pickBuyItem,
