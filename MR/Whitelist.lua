@@ -1,11 +1,12 @@
 -- ── Whitelist config ────────────────────────────────────────────────
 -- WHITELIST_ENABLED = true   -> only the HWIDs listed below can load
 -- WHITELIST_ENABLED = false  -> public mode: anyone can load
-local WHITELIST_ENABLED = false
+local WHITELIST_ENABLED = true
 
 -- [ raw gethwid() ] = expiry (Unix time). Gate kicks if os.time() > expiry.
 local entries = {
-    ["ca4169567d75af4344c01ec48172ce22f2f57a44363ddf9b07b5fbe0a687d00c21f8db56b3d5aa46c4006b8498687c37"] = 1816230439,
+    ["ca4169567d75af4344c01ec48172ce22f2f57a44363ddf9b07b5fbe0a687d00c21f8db56b3d5aa46c4006b8498687c37"] = 9999999999,
+    ["92d23061dce80448f72c8fa5ae3176cf9a56825a6ae6b866642f69b56f6e3094"] = 9999999999,
 }
 -- ────────────────────────────────────────────────────────────────────
 
