@@ -1,4 +1,4 @@
--- Universal Auto-Trade v1.11-oneshot  |  bundled by tools/bundle.py - do not edit.
+-- Universal Auto-Trade v1.12-spyfix  |  bundled by tools/bundle.py - do not edit.
 -- Source of truth: src/*.lua  (regenerate: python tools/bundle.py)
 local __M = {}
 __M["lib.parse"] = (function()
@@ -833,7 +833,7 @@ local REQUIRED = { "trading_acceptinvite", "trading_additem", "trading_removeite
 -- Extra remotes (looked up but not fatal if absent). Only trading_sendinvite is
 -- real - the deob shows the game has NO status/invite events; status comes from
 -- Library.Network.Invoke("Trading_GetStatus") (see gamedata.getStatus).
-local OPTIONAL = { "trading_sendinvite" }
+local OPTIONAL = { "trading_sendinvite", "trading_updategemoffer" }
 
 function M.resolveRemotes(timeout)
   timeout = timeout or 30
@@ -1026,6 +1026,41 @@ function M.findActiveTrade(s)
     end
   end
   return nil
+end
+
+-- Role-aware view of the live activeTrade. Confirmed from a remote-spy capture:
+-- fields are offeredGems{Player,Target}, offeredItems{Player,Target},
+-- {player,target}Confirmed, plus `player`/`target` Player objects and tradeUID.
+-- CRUCIALLY the inviter is "target" and the invitee is "player", so which side
+-- is US varies per trade - match LocalPlayer, then read OUR vs THEIR fields.
+local function cap(s) return s:sub(1, 1):upper() .. s:sub(2) end
+function M.tradeInfo(at)
+  if type(at) ~= "table" then return nil end
+  local me = Players.LocalPlayer and Players.LocalPlayer.UserId
+  local function uidOf(p)
+    if type(p) ~= "userdata" and type(p) ~= "table" then return nil end
+    local ok, v = pcall(function() return p.UserId end)
+    return ok and v or nil
+  end
+  local mySide
+  if me then
+    if uidOf(at.player) == me then mySide = "player"
+    elseif uidOf(at.target) == me then mySide = "target" end
+  end
+  local known = mySide ~= nil
+  mySide = mySide or "player"
+  local their = (mySide == "player") and "target" or "player"
+  local mc, tc = cap(mySide), cap(their)
+  return {
+    mySide = mySide, theirSide = their, sideKnown = known,
+    myGems = tonumber(at["offeredGems" .. mc]) or 0,
+    buyerGems = tonumber(at["offeredGems" .. tc]) or 0,
+    myItems = at["offeredItems" .. mc],
+    theirItems = at["offeredItems" .. tc],
+    iConfirmed = at[mySide .. "Confirmed"],
+    theirConfirmed = at[their .. "Confirmed"],
+    tradeUID = at.tradeUID,
+  }
 end
 
 -- Does the server currently mark US as in a trade? (busyPlayers is uid-keyed,
@@ -1371,7 +1406,6 @@ __M["runtime.trade"] = (function()
 local pricing = __M["lib.pricing"]
 local negotiation = __M["lib.negotiation"]
 local scamguard = __M["lib.scamguard"]
-local tf = __M["lib.tradefields"]
 local gamedata = __M["runtime.gamedata"]
 
 local M = {}
@@ -1379,28 +1413,33 @@ local M = {}
 -- deps: { remotes, cfg, feed, catalog, getActiveTrade, refreshStatus,
 --         pickSellItem, pickBuyItem, sendTradeMsg, log, mode, onSold, onBought }
 function M.new(deps)
-  return setmetatable({ d = deps, busy = false, loggedField = false, loggedConfirmField = false }, { __index = M })
+  return setmetatable({ d = deps, busy = false, loggedSide = false }, { __index = M })
 end
 
--- Robust buyer-gems read; logs which field matched, once.
+-- Role-aware view of the trade (which side is us varies: inviter=target,
+-- invitee=player). Logs our detected role once.
+function M:info(at)
+  local ti = gamedata.tradeInfo(at)
+  if ti and not self.loggedSide then
+    self.loggedSide = true
+    self.d.log(("trade role: we are '%s'%s; buyer gems from offeredGems%s")
+      :format(ti.mySide, ti.sideKnown and "" or " [GUESSED - couldn't match LocalPlayer]",
+        (ti.theirSide == "player") and "Player" or "Target"))
+  end
+  return ti
+end
+
+-- Gems the buyer (the OTHER party) has put in.
 function M:buyerGems(at)
-  local g, field = tf.buyerGems(at)
-  if field and not self.loggedField then
-    self.loggedField = true
-    self.d.log("buyer-gems field = '" .. tostring(field) .. "'")
-  end
-  return g
+  local ti = self:info(at)
+  return ti and ti.buyerGems or 0
 end
 
--- Robust "other player pressed confirm" read; logs which field matched, once.
--- nil = no matching field found (unknown) - callers must never confirm on it.
+-- Whether the buyer has pressed confirm. nil = unknown (never confirm on it).
 function M:targetConfirmed(at)
-  local v, field = tf.targetConfirmed(at)
-  if field and not self.loggedConfirmField then
-    self.loggedConfirmField = true
-    self.d.log("target-confirm field = '" .. tostring(field) .. "'")
-  end
-  return v
+  local ti = self:info(at)
+  if not ti then return nil end
+  return ti.theirConfirmed
 end
 
 -- Live trade object via a fresh status poll (searched, not just .activeTrade -
@@ -1463,11 +1502,13 @@ function M:verifyCompletion(prevUID)
   return false
 end
 
--- Shared confirm protocol: capture the trade uid, fire the confirm remote,
--- verify completion. Returns true only when the trade demonstrably finished.
+-- Shared confirm protocol: fire the confirm remote, verify completion.
+-- Spy-confirmed: trading_confirmtrade takes the ENTIRE current trade object as
+-- its argument (not no-args) - the server validates you're confirming the exact
+-- state you see. Returns true only when the trade demonstrably finished.
 function M:confirmTrade(fresh)
   local prevUID = (type(fresh) == "table") and fresh.tradeUID or nil
-  self.d.remotes.trading_confirmtrade:FireServer()
+  self.d.remotes.trading_confirmtrade:FireServer(fresh)
   return self:verifyCompletion(prevUID)
 end
 
@@ -1532,10 +1573,11 @@ function M:acceptAndWait(invite)
   return nil
 end
 
--- Is our item already sitting in the trade? (offeredItemsPlayer = OUR side,
--- confirmed live.) Prevents re-adding the same item on a re-handled window.
+-- Is our item already sitting in the trade? Uses OUR side (role-aware).
+-- Prevents re-adding the same item on a re-handled window.
 function M:itemAlreadyOffered(at, id)
-  local mine = type(at) == "table" and at.offeredItemsPlayer or nil
+  local ti = self:info(at)
+  local mine = ti and ti.myItems or nil
   if type(mine) ~= "table" then return false end
   for _, it in pairs(mine) do
     local iid = (type(it) == "table" and (it.itemID or it.id or it.ID)) or it
@@ -1702,7 +1744,9 @@ end
 function M:addItem(setName)
   local c = self.d.catalog[setName]
   if not c then self.d.log("no itemID for '" .. tostring(setName) .. "'"); return false end
-  local descriptor = { { itemID = tostring(c.id), className = c.className or setName } }
+  -- Spy-confirmed: the descriptor is passed DIRECTLY (not array-wrapped) -
+  -- trading_additem:FireServer({itemID="4", className="Appliance"}).
+  local descriptor = { itemID = tostring(c.id), className = c.className or setName }
   self.d.remotes.trading_additem:FireServer(descriptor)
   self.d.log(("added %s (id %s class %s)"):format(setName, tostring(c.id), tostring(c.className)))
   return true
@@ -2044,7 +2088,7 @@ end)()
 -- (workspace.__THINGS.__REMOTES + Framework.Library) and builds its own WindUI.
 local CONFIG = {
   feedUrl = "https://raw.githubusercontent.com/0xfray/Mr-script/refs/heads/main/MR/value.lua",
-  version = "v1.11-oneshot",
+  version = "v1.12-spyfix",
 }
 
 local libConfig  = __M["lib.config"]
