@@ -51,6 +51,23 @@
 - Place-locked: refuses to run outside the supported trading hubs
 - Every action fails closed, with a logged reason
 
+### Privacy Mode
+- Replaces your username with a randomised alias everywhere on screen
+- Hides the player list, every overhead nameplate, and your avatar
+- Masks your name inside the game's own UI, not just Roblox's
+- Other players get consistent aliases too, so nothing in your screenshots identifies anyone
+- Aliases stay stable for the whole session, and reset on each launch
+- Fully reversible - toggle it off and everything returns to normal
+
+### Demo Chat
+- Generates realistic plaza chatter so a demo never looks like a dead server
+- Lines reference the items you're actually selling
+- Rendered with a client-only API - **nothing is ever sent**, nobody else sees a single line
+- Senders are invented aliases, never real players
+- Adjustable frequency, with a live transcript inside the panel
+
+-# Both are off by default. Privacy Mode masks your own view - other players in the server still see your real name.
+
   ### Built to Run Unattended
 - Anti-AFK defeats the idle disconnect
 - Automatic reconnect and rejoin after a drop
